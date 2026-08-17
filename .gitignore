@@ -1,0 +1,7 @@
+# SECRETS — never commit. Copy these two files to a new machine by hand
+# (USB / password manager / encrypted transfer), never via git.
+.dhan_credentials.json
+.dhan_token.json
+*.tmp
+__pycache__/
+*.pyc
