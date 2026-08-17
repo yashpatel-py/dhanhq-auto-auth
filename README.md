@@ -81,9 +81,7 @@ cd <wherever>/strategy_by_ai
 git clone https://github.com/yashpatel-py/yash-dhan-auth.git yash_dhan_auth
 git clone https://github.com/yashpatel-py/skew-hunter-options.git skew_hunter
 git clone https://github.com/yashpatel-py/swing-dual-momentum.git swing_dual_momentum
-python -m pip install -r skew_hunter
-equirements.txt -r swing_dual_momentum
-equirements.txt
+python -m pip install -r skew_hunter/requirements.txt -r swing_dual_momentum/requirements.txt
 ```
 
 Then EITHER copy `.dhan_credentials.json` from the old machine into
