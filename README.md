@@ -19,22 +19,35 @@ strategy_by_ai/
 └── swing_dual_momentum/       <- uses it via dhan_data.py
 ```
 
-## One-time setup (already done on this machine)
+The package itself needs only `dhanhq>=2.2.0` and `pyotp`; it has no
+`requirements.txt` of its own, and installing either strategy's requirements
+covers it. `verify.py` launches each strategy in a subprocess, so its
+strategy checks additionally need whatever those strategies import.
+
+## First-time setup — once per machine
+
+Already done on this machine. Run this only on a **new** machine: it
+overwrites `.dhan_credentials.json`, so re-running it here would replace
+working credentials.
 
 ```bash
-cd C:\Users\Administrator\Desktop\strategy_by_ai\yash_dhan_auth
-python credentials_setup.py
+cd C:\Users\yashp\OneDrive\Desktop\strategy_by_ai\yash_dhan_auth
+..\.venv\Scripts\python.exe credentials_setup.py
 ```
 
-Prompts for Client ID, login PIN, and TOTP secret; verifies the TOTP; writes
-`.dhan_credentials.json` here. Tokens are then generated automatically —
-Dhan tokens expire daily, and `get_valid_token_with_retry()` transparently
-reuses today's token, renews it, or generates a fresh one via PIN+TOTP.
+Prompts for Client ID, login PIN, and TOTP secret (the last two are hidden
+as you type — that is `getpass`, not a frozen terminal). It generates a test
+TOTP code to confirm the secret is valid, then writes
+`.dhan_credentials.json` here.
+
+That is the only manual step. Tokens are generated automatically from then
+on — you never run a "log in" command as part of daily use.
 
 ## Check it's working
 
 ```bash
-python verify.py
+cd C:\Users\yashp\OneDrive\Desktop\strategy_by_ai\yash_dhan_auth
+..\.venv\Scripts\python.exe verify.py
 ```
 
 Runs each strategy's own auth path in its own subprocess — the way they
@@ -42,6 +55,24 @@ really run — and asserts that all of them land on the same token file, the
 same token, and the same client id, and that running them did not trigger a
 second login. Expect `All 10 checks passed`. Add `--no-login` to check the
 stored token without ever performing a login.
+
+## What actually happens on a call
+
+`get_valid_token_with_retry()` is the entry point every strategy uses. In
+order:
+
+1. **Token from today on disk, and Dhan accepts it** → returned as-is. This
+   is the common path; no network login.
+2. **Token missing, from an earlier day, or rejected** → take
+   `.dhan_token.lock`, then re-check (another strategy may have just
+   refreshed it while we queued) and reuse if so.
+3. **Still no good** → renew, falling back to a fresh PIN+TOTP login if Dhan
+   refuses the renewal too.
+
+"From today" means the IST calendar date the token was generated. Dhan's own
+tokens run roughly 24h from issue (`user_profile` reports `tokenValidity`),
+so keying on the date is deliberately the more conservative of the two — it
+refreshes at the day boundary rather than riding a token to its true expiry.
 
 ## Using it in ANY new strategy — the recipe
 
@@ -77,12 +108,36 @@ from dhan_data import get_client
 chain = get_client().option_chain(...)      # or historical_daily_data, orders, ...
 ```
 
-That's the whole integration. Useful extras:
+Note the import order this creates: it is `import dhan_data` that puts
+`strategy_by_ai/` on `sys.path`, so anything importing `yash_dhan_auth`
+directly must do so *after* that first import.
+
+That's the whole integration. The full public API:
 
 ```python
-from yash_dhan_auth import TOKEN_FILE        # path to today's token json
-from yash_dhan_auth import validate_token    # check a token against user_profile
+from yash_dhan_auth import (
+    get_valid_token_with_retry,  # (cid, token) with retries — use this one
+    get_valid_token,             # same, single attempt
+    force_refresh,               # discard current token, get a new one
+    validate_token,              # (cid, token) -> bool, via user_profile
+    generate_token,              # force a fresh PIN+TOTP login
+    renew_token,                 # renew, falling back to generate
+    TOKEN_FILE,                  # path to today's token json
+    CREDS_FILE,                  # path to the credentials json
+)
 ```
+
+## Running both strategies at once
+
+Each strategy has its own watchdog and its own dashboard port
+(`skew_hunter` 8080, `swing_dual_momentum` 8081), and
+`strategy_by_ai/watchdog_all.py` runs both under one supervisor.
+
+Starting them together is safe: the lock in rule 2 means the first process
+performs the login and the second reuses the token it wrote, so two
+strategies starting seconds apart still produce exactly one Dhan login.
+`watchdog_all.py` additionally staggers its starts by a few seconds so the
+second one finds a finished token rather than waiting on a TOTP round-trip.
 
 ## Moving to a new machine (e.g. VPS → laptop)
 
@@ -102,11 +157,24 @@ Then EITHER copy `.dhan_credentials.json` from the old machine into
 `yash_dhan_auth/` (USB / password manager / encrypted transfer — **not git,
 not chat, not email**), OR simply run `python credentials_setup.py` there and
 re-enter Client ID + PIN + TOTP secret. Do not copy `.dhan_token.json`; a
-fresh token is generated on first use. Also copy each strategy's
-`.telegram_config.json` if you want alerts on the new machine.
+fresh token is generated on first use. Do not copy `.dhan_token.lock`
+either — it is transient, and a stale one only causes a 180s wait. Also copy
+each strategy's `.telegram_config.json` if you want alerts on the new
+machine.
 
 Note: only ONE machine should run a given strategy at a time (two schedulers
-= two paper ledgers diverging, or two live order streams).
+= two paper ledgers diverging, or two live order streams). The lock here is
+per-filesystem; it cannot coordinate across machines.
+
+## Troubleshooting
+
+| Symptom | What it means |
+|---|---|
+| `DH-901 Invalid_Authentication` | Token rejected. The package now renews or re-logs in by itself — no manual step. If it persists, your TOTP secret probably changed; re-run `credentials_setup.py`. |
+| `Timed out waiting for another process to finish Dhan login` | Another strategy held `.dhan_token.lock` for over 4 minutes. Check whether that process is wedged; a lock from a *dead* process is broken automatically after 180s. |
+| `Failed to obtain valid token after 3 attempts` | All retries failed. Run `verify.py` to see which step breaks, and check Dhan is not down. |
+| `No credentials found` | `.dhan_credentials.json` is missing — this machine was never set up, or the file was moved. |
+| `DH-905 Input_Exception` on market data | **Not** an auth problem. Dhan rejecting a data request for a specific instrument; auth is fine if `verify.py` passes. |
 
 ## Rules
 
@@ -129,3 +197,7 @@ Note: only ONE machine should run a given strategy at a time (two schedulers
 4. Existing consumers: `skew_hunter/auth/` is a thin shim re-exporting this
    package (old imports keep working); `swing_dual_momentum/dhan_data.py`
    uses the recipe above.
+5. `.dhan_credentials.json` holds your PIN and TOTP secret in plaintext.
+   That is fine locally, but note this tree currently sits under OneDrive,
+   so the file syncs to the cloud — move `strategy_by_ai/` outside OneDrive
+   if you would rather it did not.
