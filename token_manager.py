@@ -11,11 +11,22 @@ Token lifecycle:
   - Dhan access tokens expire daily (end of day or ~24h)
   - On each trading day start, generate a fresh token
   - Before each API call batch, validate & renew if needed
+
+Concurrency:
+  Several processes start independently and all call get_valid_token()
+  (skew_hunter's scheduler / dashboard / watchdog, swing_dual_momentum's
+  tracker). Dhan issues ONE live access token per client, so two
+  simultaneous logins mean the second silently invalidates the first and
+  whichever bot cached the older token starts failing mid-session. A
+  cross-process lock file serialises the mutating paths so exactly one
+  process logs in and the others reuse the token it writes.
 """
 import json
 import logging
 import os
+import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 
@@ -27,9 +38,17 @@ logger = logging.getLogger("auth.token_manager")
 _PKG_DIR = os.path.abspath(os.path.dirname(__file__))
 CREDS_FILE = os.path.join(_PKG_DIR, ".dhan_credentials.json")
 TOKEN_FILE = os.path.join(_PKG_DIR, ".dhan_token.json")
+LOCK_FILE = os.path.join(_PKG_DIR, ".dhan_token.lock")
+
+# A PIN+TOTP round-trip takes a few seconds, and the retry path waits at most
+# one 30s TOTP window. A lock older than this belonged to a process that died
+# mid-login, so it is safe to break.
+LOCK_STALE_SEC = 180
+LOCK_WAIT_SEC = 240
 
 _cached_token: dict | None = None
 _token_date: date | None = None
+_thread_lock = threading.Lock()   # guards the mutating path within one process
 
 
 def _load_credentials() -> dict:
@@ -78,6 +97,92 @@ def _load_saved_token() -> dict | None:
     return None
 
 
+def _invalidate_cache() -> None:
+    """Drop the in-process cache so the next read comes from disk.
+
+    Needed after taking the cross-process lock: another process may have
+    written a fresh token while we were queued behind it.
+    """
+    global _cached_token, _token_date
+    _cached_token = None
+    _token_date = None
+
+
+def _is_from_today(saved: dict | None) -> bool:
+    return bool(saved) and saved.get("generated_date") == datetime.now(IST).date().isoformat()
+
+
+@contextmanager
+def _login_lock(wait: int = LOCK_WAIT_SEC):
+    """Serialise token generation/renewal across processes AND threads.
+
+    O_CREAT|O_EXCL is atomic on Windows and POSIX alike, so the create either
+    wins outright or tells us somebody else holds the lock.
+    """
+    with _thread_lock:
+        deadline = time.time() + wait
+        fd = None
+        while True:
+            try:
+                fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, f"{os.getpid()} {datetime.now(IST).isoformat()}\n".encode())
+                break
+            except FileExistsError:
+                try:
+                    age = time.time() - os.path.getmtime(LOCK_FILE)
+                except OSError:
+                    continue        # holder released it between the two calls
+                if age > LOCK_STALE_SEC:
+                    logger.warning(f"Breaking stale token lock ({age:.0f}s old)")
+                    try:
+                        os.unlink(LOCK_FILE)
+                    except OSError:
+                        pass
+                    continue
+                if time.time() > deadline:
+                    raise RuntimeError(
+                        f"Timed out after {wait}s waiting for another process to finish "
+                        f"Dhan login (lock: {LOCK_FILE})"
+                    )
+                time.sleep(1.0)
+        try:
+            yield
+        finally:
+            if fd is not None:
+                os.close(fd)
+            try:
+                os.unlink(LOCK_FILE)
+            except OSError:
+                pass
+
+
+def _sdk_call(what: str, fn, *args, **kwargs) -> tuple[bool, object]:
+    """Call a DhanLogin method, normalising its two failure styles.
+
+    dhanhq 2.2.0 RAISES on any non-200 response (see dhanhq/auth.py) rather
+    than returning the error body. Without this wrapper every `if not resp` /
+    `resp.get("remarks")` branch below is dead code and the documented
+    fallbacks (renew -> fresh TOTP) never run, so a token Dhan rejects takes
+    the whole day down until .dhan_token.json is deleted by hand.
+
+    Returns (ok, payload) where payload is the response dict or an error string.
+    """
+    try:
+        resp = fn(*args, **kwargs)
+    except Exception as e:
+        logger.debug(f"{what}: {e}")
+        return False, str(e)
+    if not resp:
+        return False, "No response"
+    return True, resp
+
+
+def _extract_token(resp) -> str | None:
+    if not isinstance(resp, dict):
+        return None
+    return resp.get("accessToken") or (resp.get("data") or {}).get("access_token")
+
+
 def generate_token() -> tuple[str, str]:
     """Generate a fresh access token using PIN + TOTP. Returns (client_id, access_token).
 
@@ -102,27 +207,26 @@ def generate_token() -> tuple[str, str]:
         )
 
         login = DhanLogin(client_id)
-        resp = login.generate_token(pin=pin, totp=otp_code)
+        ok, resp = _sdk_call("generate_token", login.generate_token, pin=pin, totp=otp_code)
 
-        if not resp:
-            raise RuntimeError("Token generation failed: No response")
+        if ok:
+            access_token = _extract_token(resp)
+            if access_token:
+                _save_token(client_id, access_token)
+                logger.info("New access token generated successfully")
+                return client_id, access_token
+            error_msg = str(resp.get("remarks", resp)) if isinstance(resp, dict) else str(resp)
+        else:
+            error_msg = str(resp)
 
-        access_token = (
-            resp.get("accessToken")
-            or (resp.get("data") or {}).get("access_token")
-        )
-        if access_token:
-            _save_token(client_id, access_token)
-            logger.info("New access token generated successfully")
-            return client_id, access_token
-
-        error_msg = str(resp.get("remarks", resp))
         last_error = error_msg
 
-        # TOTP rejected — possibly expired during network round-trip.
-        # Wait for the next 30-second window and retry exactly once.
-        if totp_attempt < 2 and (
-            "TOTP" in error_msg.upper() or "OTP" in error_msg.upper()
+        # TOTP rejected — possibly expired during the network round-trip, which
+        # Dhan reports as a generic auth failure (DH-901). Wait for the next
+        # 30-second window and retry exactly once.
+        upper = error_msg.upper()
+        if totp_attempt < 2 and any(
+            k in upper for k in ("TOTP", "OTP", "DH-901", "INVALID_AUTHENTICATION")
         ):
             remaining = 30 - (int(time.time()) % 30)
             # If we're near the end of the current window, skip past it entirely
@@ -140,7 +244,12 @@ def generate_token() -> tuple[str, str]:
 
 
 def renew_token() -> tuple[str, str]:
-    """Renew an existing token. Returns (client_id, access_token)."""
+    """Renew an existing token. Returns (client_id, access_token).
+
+    Falls back to a fresh PIN+TOTP login whenever renewal cannot deliver a
+    token — including when Dhan rejects the old one outright (DH-901), which
+    is the common case for a token that was revoked rather than merely aged.
+    """
     from dhanhq import DhanLogin
 
     saved = _load_saved_token()
@@ -153,16 +262,13 @@ def renew_token() -> tuple[str, str]:
 
     logger.info("Renewing access token...")
     login = DhanLogin(client_id)
-    resp = login.renew_token(old_token)
+    ok, resp = _sdk_call("renew_token", login.renew_token, old_token)
 
-    if not resp:
-        logger.warning("Token renewal failed: no response — generating fresh token")
+    if not ok:
+        logger.warning(f"Token renewal failed ({resp}) — generating fresh token")
         return generate_token()
 
-    new_token = (
-        resp.get("accessToken")
-        or (resp.get("data") or {}).get("access_token")
-    )
+    new_token = _extract_token(resp)
     if not new_token:
         logger.warning(f"Token renewal failed: {resp} — generating fresh token")
         return generate_token()
@@ -175,15 +281,35 @@ def renew_token() -> tuple[str, str]:
 def validate_token(client_id: str, access_token: str) -> bool:
     """Check if the token is still valid by hitting user_profile."""
     from dhanhq import DhanLogin
-    try:
-        login = DhanLogin(client_id)
-        resp = login.user_profile(access_token)
-        if resp and (resp.get("status") == "success" or resp.get("dhanClientId")):
-            return True
-        logger.warning(f"Token validation failed: {resp}")
-    except Exception as e:
-        logger.warning(f"Token validation error: {e}")
+    login = DhanLogin(client_id)
+    ok, resp = _sdk_call("user_profile", login.user_profile, access_token)
+    if ok and isinstance(resp, dict) and (
+        resp.get("status") == "success" or resp.get("dhanClientId")
+    ):
+        return True
+    logger.warning(f"Token validation failed: {resp}")
     return False
+
+
+def _refresh_locked() -> tuple[str, str]:
+    """Renew-or-generate. Caller must hold the login lock."""
+    saved = _load_saved_token()
+
+    if saved:
+        if _is_from_today(saved):
+            logger.info("Today's token is invalid — renewing")
+            return renew_token()
+        logger.info(
+            f"Token is from {saved.get('generated_date', '')}, generating fresh one for today"
+        )
+        try:
+            return generate_token()
+        except Exception as e:
+            logger.warning(f"Fresh generation failed: {e} — trying renewal")
+            return renew_token()
+
+    logger.info("No saved token — generating new one")
+    return generate_token()
 
 
 def get_valid_token() -> tuple[str, str]:
@@ -193,33 +319,34 @@ def get_valid_token() -> tuple[str, str]:
     Logic:
       1. If we have a token from today, validate it
       2. If valid, return it
-      3. If invalid or expired, try renew
-      4. If renew fails, generate fresh via TOTP
+      3. If invalid or expired, take the cross-process lock and re-check
+         (another strategy may have just refreshed it)
+      4. Still no good -> renew, and fall back to a fresh TOTP login
     """
     saved = _load_saved_token()
+    if _is_from_today(saved) and validate_token(saved["client_id"], saved["access_token"]):
+        logger.debug("Existing token is valid")
+        return saved["client_id"], saved["access_token"]
 
-    if saved:
-        client_id = saved["client_id"]
-        access_token = saved["access_token"]
-        token_date = saved.get("generated_date", "")
+    # Mutating path — only one process may log in at a time.
+    with _login_lock():
+        _invalidate_cache()
+        saved = _load_saved_token()
+        if _is_from_today(saved) and validate_token(saved["client_id"], saved["access_token"]):
+            logger.info("Another process refreshed the token while we waited — reusing it")
+            return saved["client_id"], saved["access_token"]
+        return _refresh_locked()
 
-        if token_date == datetime.now(IST).date().isoformat():
-            if validate_token(client_id, access_token):
-                logger.debug("Existing token is valid")
-                return client_id, access_token
-            else:
-                logger.info("Today's token is invalid — renewing")
-                return renew_token()
-        else:
-            logger.info(f"Token is from {token_date}, generating fresh one for today")
-            try:
-                return generate_token()
-            except Exception as e:
-                logger.warning(f"Fresh generation failed: {e} — trying renewal")
-                return renew_token()
 
-    logger.info("No saved token — generating new one")
-    return generate_token()
+def force_refresh() -> tuple[str, str]:
+    """Discard the current token and obtain a new one.
+
+    For mid-session recovery: if Dhan starts returning DH-901 on a token that
+    was working, call this rather than restarting the strategy.
+    """
+    with _login_lock():
+        _invalidate_cache()
+        return _refresh_locked()
 
 
 def get_valid_token_with_retry(max_retries: int = 3, delay: int = 30) -> tuple[str, str]:

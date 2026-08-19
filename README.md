@@ -10,8 +10,10 @@ strategy_by_ai/
 ├── yash_dhan_auth/            <- this package (credentials + daily token)
 │   ├── .dhan_credentials.json    client id + PIN + TOTP secret  (NEVER commit)
 │   ├── .dhan_token.json          today's access token           (NEVER commit)
+│   ├── .dhan_token.lock          transient login lock           (NEVER commit)
 │   ├── token_manager.py          generate / renew / validate / cache
 │   ├── credentials_setup.py      one-time interactive setup
+│   ├── verify.py                 prove one login serves every strategy
 │   └── __init__.py
 ├── skew_hunter/               <- uses it via its auth/ shim
 └── swing_dual_momentum/       <- uses it via dhan_data.py
@@ -28,6 +30,18 @@ Prompts for Client ID, login PIN, and TOTP secret; verifies the TOTP; writes
 `.dhan_credentials.json` here. Tokens are then generated automatically —
 Dhan tokens expire daily, and `get_valid_token_with_retry()` transparently
 reuses today's token, renews it, or generates a fresh one via PIN+TOTP.
+
+## Check it's working
+
+```bash
+python verify.py
+```
+
+Runs each strategy's own auth path in its own subprocess — the way they
+really run — and asserts that all of them land on the same token file, the
+same token, and the same client id, and that running them did not trigger a
+second login. Expect `All 10 checks passed`. Add `--no-login` to check the
+stored token without ever performing a login.
 
 ## Using it in ANY new strategy — the recipe
 
@@ -101,10 +115,17 @@ Note: only ONE machine should run a given strategy at a time (two schedulers
    repos anyway, in this folder).
 2. **Only this package generates tokens.** If a strategy generates its own,
    two TOTP logins in the same 30-second window can collide. All strategies
-   share today's token from `.dhan_token.json` here.
-3. If Dhan rejects auth (`DH-901`), delete `.dhan_token.json` and run any
-   strategy — a fresh token is generated automatically. If the TOTP secret
-   itself changed (re-enabled 2FA), re-run `credentials_setup.py`.
+   share today's token from `.dhan_token.json` here. This is now *enforced*,
+   not just requested: `get_valid_token()` takes a `.dhan_token.lock` before
+   it logs in, so if two bots start together one performs the login and the
+   other waits and reuses its token. A lock left behind by a killed process
+   is broken automatically after 180s.
+3. If Dhan rejects auth (`DH-901`), the package now recovers on its own —
+   it renews, and falls back to a fresh PIN+TOTP login if renewal is also
+   refused. Deleting `.dhan_token.json` by hand is no longer needed. To force
+   a new token mid-session (rather than restarting a strategy), call
+   `force_refresh()`. If the TOTP secret itself changed (re-enabled 2FA),
+   re-run `credentials_setup.py`.
 4. Existing consumers: `skew_hunter/auth/` is a thin shim re-exporting this
    package (old imports keep working); `swing_dual_momentum/dhan_data.py`
    uses the recipe above.

@@ -2,6 +2,7 @@
 # (USB / password manager / encrypted transfer), never via git.
 .dhan_credentials.json
 .dhan_token.json
+.dhan_token.lock
 *.tmp
 __pycache__/
 *.pyc
