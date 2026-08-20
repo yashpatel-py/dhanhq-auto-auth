@@ -16,7 +16,8 @@ strategy_by_ai/
 │   ├── verify.py                 prove one login serves every strategy
 │   └── __init__.py
 ├── skew_hunter/               <- uses it via its auth/ shim
-└── swing_dual_momentum/       <- uses it via dhan_data.py
+├── swing_dual_momentum/       <- uses it via dhan_data.py
+└── dhan-nifty-options-paper-strategy/ <- paper-only data client via strategy/dhan_data.py
 ```
 
 The package itself needs only `dhanhq>=2.2.0` and `pyotp`; it has no
@@ -53,7 +54,7 @@ cd C:\Users\yashp\OneDrive\Desktop\strategy_by_ai\yash_dhan_auth
 Runs each strategy's own auth path in its own subprocess — the way they
 really run — and asserts that all of them land on the same token file, the
 same token, and the same client id, and that running them did not trigger a
-second login. Expect `All 10 checks passed`. Add `--no-login` to check the
+second login. Expect `All 13 checks passed`. Add `--no-login` to check the
 stored token without ever performing a login.
 
 ## What actually happens on a call
@@ -196,7 +197,8 @@ per-filesystem; it cannot coordinate across machines.
    re-run `credentials_setup.py`.
 4. Existing consumers: `skew_hunter/auth/` is a thin shim re-exporting this
    package (old imports keep working); `swing_dual_momentum/dhan_data.py`
-   uses the recipe above.
+   uses the recipe above; and `dhan-nifty-options-paper-strategy/strategy/dhan_data.py`
+   uses it only for historical data and quotes in the paper-only system.
 5. `.dhan_credentials.json` holds your PIN and TOTP secret in plaintext.
    That is fine locally, but note this tree currently sits under OneDrive,
    so the file syncs to the cloud — move `strategy_by_ai/` outside OneDrive

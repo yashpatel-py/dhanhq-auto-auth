@@ -8,9 +8,10 @@ Checks, in order:
   2. get_valid_token() returns a token Dhan actually accepts (user_profile)
   3. skew_hunter, in its OWN process, resolves the same token file and token
   4. swing_dual_momentum, in its OWN process, resolves the same token
-  5. neither strategy triggered a second login (the token is unchanged)
+  5. dhan-nifty-options-paper-strategy resolves the same token
+  6. no strategy triggered a second login (the token is unchanged)
 
-Step 3/4 run as subprocesses on purpose: that is how the strategies really
+Steps 3/4/5 run as subprocesses on purpose: that is how the strategies really
 run, and it is the only way to catch two of them logging in separately and
 invalidating each other's token.
 
@@ -72,6 +73,14 @@ cid, tok = get_valid_token_with_retry()
 _SWING_IMPORT = """
 import dhan_data
 dhan_data.get_client()          # the real client the strategy would trade with
+from yash_dhan_auth import TOKEN_FILE as tf, get_valid_token_with_retry
+cid, tok = get_valid_token_with_retry()
+"""
+
+_NIFTY_PAPER_IMPORT = """
+from strategy.dhan_data import get_client
+from strategy.settings import DhanSettings
+get_client(DhanSettings.from_env())  # read-only client; paper controls stay enforced
 from yash_dhan_auth import TOKEN_FILE as tf, get_valid_token_with_retry
 cid, tok = get_valid_token_with_retry()
 """
@@ -145,11 +154,26 @@ def main() -> int:
               fingerprint(swing["token"]))
         check("same client id", swing["client_id"] == cid, swing["client_id"])
 
-    print("\n5) No strategy triggered a second login")
+    print("\n5) dhan-nifty-options-paper-strategy (own process, via strategy.dhan_data)")
+    nifty_paper = probe(
+        "dhan-nifty-options-paper-strategy",
+        os.path.join(_PARENT, "dhan-nifty-options-paper-strategy"),
+        _NIFTY_PAPER_IMPORT,
+    )
+    if nifty_paper:
+        check("resolves the shared token file",
+              os.path.normcase(nifty_paper["token_file"]) == os.path.normcase(TOKEN_FILE),
+              nifty_paper["token_file"])
+        check("gets the same token", fingerprint(nifty_paper["token"]) == base,
+              fingerprint(nifty_paper["token"]))
+        check("same client id", nifty_paper["client_id"] == cid,
+              nifty_paper["client_id"])
+
+    print("\n6) No strategy triggered a second login")
     final = json.load(open(TOKEN_FILE))
-    check("token on disk unchanged after both strategies ran",
+    check("token on disk unchanged after all strategies ran",
           fingerprint(final["access_token"]) == base,
-          f"{base} (one login serves both)")
+          f"{base} (one login serves all)")
     check("token still accepted by Dhan",
           validate_token(final["client_id"], final["access_token"]))
 
@@ -158,7 +182,7 @@ def main() -> int:
     if failed:
         print(f"{failed} of {len(_results)} checks FAILED")
         return 1
-    print(f"All {len(_results)} checks passed — one login authenticates both strategies.")
+    print(f"All {len(_results)} checks passed — one login authenticates every strategy.")
     return 0
 
 
