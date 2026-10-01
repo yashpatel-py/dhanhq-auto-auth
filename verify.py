@@ -5,7 +5,8 @@
 
 Checks, in order:
   1. credentials + token files are where the shared package expects them
-  2. get_valid_token() returns a token Dhan actually accepts (user_profile)
+  2. get_valid_token() returns a token Dhan actually accepts (user_profile),
+     and Dhan serves market data to it (one LTP quote)
   3. skew_hunter, in its OWN process, resolves the same token file and token
   4. swing_dual_momentum, in its OWN process, resolves the same token
   5. dhan-nifty-options-paper-strategy resolves the same token
@@ -36,7 +37,8 @@ try:
 except Exception:
     pass
 
-from yash_dhan_auth import CREDS_FILE, TOKEN_FILE, validate_token   # noqa: E402
+from yash_dhan_auth import (CREDS_FILE, TOKEN_FILE, data_access,     # noqa: E402
+                            token_type, validate_token)
 
 OK, BAD = "  [ OK ]", "  [FAIL]"
 _results: list[bool] = []
@@ -130,7 +132,9 @@ def main() -> int:
         from yash_dhan_auth import get_valid_token_with_retry
         cid, tok = get_valid_token_with_retry()
     check("Dhan accepts the token (user_profile)", validate_token(cid, tok),
-          f"client {cid}, token {fingerprint(tok)}")
+          f"client {cid}, token {fingerprint(tok)}, type {token_type(tok) or '?'}")
+    ok, why = data_access(cid, tok)
+    check("Dhan serves market data to it (one LTP quote)", ok, why)
     base = fingerprint(tok)
 
     print("\n3) skew_hunter (own process, via its auth/ shim)")

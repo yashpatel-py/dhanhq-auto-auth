@@ -11,6 +11,8 @@ from .token_manager import (          # noqa: F401
     generate_token,
     renew_token,
     validate_token,
+    data_access,
+    token_type,
     get_valid_token,
     get_valid_token_with_retry,
     force_refresh,

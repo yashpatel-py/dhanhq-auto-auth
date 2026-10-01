@@ -54,8 +54,10 @@ cd C:\Users\yashp\OneDrive\Desktop\strategy_by_ai\yash_dhan_auth
 Runs each strategy's own auth path in its own subprocess — the way they
 really run — and asserts that all of them land on the same token file, the
 same token, and the same client id, and that running them did not trigger a
-second login. Expect `All 13 checks passed`. Add `--no-login` to check the
-stored token without ever performing a login.
+second login. It also asks Dhan for one quote, because a token Dhan accepts
+for login can still be refused market data (see Troubleshooting). Expect
+`All 14 checks passed`. Add `--no-login` to check the stored token without
+ever performing a login.
 
 ## What actually happens on a call
 
@@ -67,13 +69,28 @@ order:
 2. **Token missing, from an earlier day, or rejected** → take
    `.dhan_token.lock`, then re-check (another strategy may have just
    refreshed it while we queued) and reuse if so.
-3. **Still no good** → renew, falling back to a fresh PIN+TOTP login if Dhan
-   refuses the renewal too.
+3. **Still no good** → log in again with PIN+TOTP. Dhan renews only tokens
+   made by hand on web.dhan.co; the ones this package makes are refused with
+   `DH-905 Renewal of token not allowed for this token type`, so it no longer
+   asks (it reads the token's type first, see below).
 
 "From today" means the IST calendar date the token was generated. Dhan's own
 tokens run roughly 24h from issue (`user_profile` reports `tokenValidity`),
 so keying on the date is deliberately the more conservative of the two — it
 refreshes at the day boundary rather than riding a token to its true expiry.
+
+### Two kinds of token
+
+Dhan stamps every token with how it was made (`tokenConsumerType`, readable
+with `token_type(token)`, no call needed):
+
+| Type | Made by | Renewable |
+|---|---|---|
+| `APP` | this package's PIN+TOTP login (`auth.dhan.co/app/generateAccessToken`) | no |
+| `SELF` | you, on web.dhan.co → Access DhanHQ APIs → Generate Access Token | yes |
+
+Every strategy uses `APP` tokens. Never paste a `SELF` token into a chat or a
+file: it is a live login to the account for 24 hours.
 
 ## Using it in ANY new strategy — the recipe
 
@@ -121,8 +138,10 @@ from yash_dhan_auth import (
     get_valid_token,             # same, single attempt
     force_refresh,               # discard current token, get a new one
     validate_token,              # (cid, token) -> bool, via user_profile
+    data_access,                 # (cid, token) -> (ok, reason): one LTP quote
+    token_type,                  # token -> "APP" | "SELF" | ""
     generate_token,              # force a fresh PIN+TOTP login
-    renew_token,                 # renew, falling back to generate
+    renew_token,                 # renew a SELF token; APP tokens log in again
     TOKEN_FILE,                  # path to today's token json
     CREDS_FILE,                  # path to the credentials json
 )
@@ -175,6 +194,7 @@ per-filesystem; it cannot coordinate across machines.
 | `Timed out waiting for another process to finish Dhan login` | Another strategy held `.dhan_token.lock` for over 4 minutes. Check whether that process is wedged; a lock from a *dead* process is broken automatically after 180s. |
 | `Failed to obtain valid token after 3 attempts` | All retries failed. Run `verify.py` to see which step breaks, and check Dhan is not down. |
 | `No credentials found` | `.dhan_credentials.json` is missing — this machine was never set up, or the file was moved. |
+| `806 Data APIs not Subscribed` or `DH-902 … HTTP Status 451` on market data, while `verify.py` shows the login accepted | Dhan has stopped serving data to the account. A new login does not change it — tried on 2026-10-02 with three fresh tokens, while other users reported the same outage on Dhan's forum (madefortrade topic 94453). Check web.dhan.co → DhanHQ APIs → Data APIs shows Active, then email apihelp@dhan.co (cc help@dhan.co) with the error and the time it started. `/v2/profile`'s `dataPlan` can still say `Active` while this happens. |
 | `DH-905 Input_Exception` on market data | **Not** an auth problem. Dhan rejecting a data request for a specific instrument; auth is fine if `verify.py` passes. |
 
 ## Rules
@@ -190,8 +210,8 @@ per-filesystem; it cannot coordinate across machines.
    other waits and reuses its token. A lock left behind by a killed process
    is broken automatically after 180s.
 3. If Dhan rejects auth (`DH-901`), the package now recovers on its own —
-   it renews, and falls back to a fresh PIN+TOTP login if renewal is also
-   refused. Deleting `.dhan_token.json` by hand is no longer needed. To force
+   it logs in again with PIN+TOTP (renewing first only for a hand-made
+   `SELF` token). Deleting `.dhan_token.json` by hand is no longer needed. To force
    a new token mid-session (rather than restarting a strategy), call
    `force_refresh()`. If the TOTP secret itself changed (re-enabled 2FA),
    re-run `credentials_setup.py`.
