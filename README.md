@@ -8,8 +8,8 @@ generation. One login a day serves everything: trading, account, and all six
 paid Data-API capabilities.
 
 ```
-strategy_by_ai/
-├── yash_dhan_auth/              <- this package
+<your-projects>/                 e.g. strategy_by_ai/
+├── yash_dhan_auth/              <- this package (clone of dhanhq-auto-auth, folder named like this)
 │   ├── .dhan_credentials.json      client id + PIN + TOTP secret   (NEVER commit)
 │   ├── .dhan_token.json            today's access token            (NEVER commit)
 │   ├── .dhan_token.lock            transient login lock            (NEVER commit)
@@ -18,21 +18,18 @@ strategy_by_ai/
 │   ├── credentials_setup.py        one-time interactive setup
 │   ├── verify.py                   proves one login serves every strategy + every capability
 │   └── tests/                      offline regressions (no network, no secrets)
-├── alpha_lab/                   <- uses it: data/dhan_history.py  (historical candles)
-├── hma_vwap/                    <- uses it: core/market.py        (option chain, intraday, live feed)
-├── premium_harvester/           <- uses it: live/dhan_client.py, data/dhan_tape.py (chain, quotes, expired options)
-├── filings_feed/                <- uses it: core/book.py          (holdings / positions)
-└── yash_kotak_auth/             <- the Kotak twin of this package
+├── your_strategy/               <- any number of these, side by side; each imports yash_dhan_auth
+└── another_strategy/
 ```
 
 Needs `dhanhq>=2.2.0`, `pyotp`, `requests`, `websockets` — all pulled in by
 any strategy's `requirements.txt`; the package has none of its own.
 
-**Using it in your own project** (anyone, not just this tree): clone it as a
-folder named `yash_dhan_auth` next to your strategy folders, add the parent
-folder to `sys.path` as shown in §3, run `credentials_setup.py` once, and
-call `get_client()`. Nothing in it is specific to the strategies above; they
-are listed only because `verify.py` probes them. MIT licensed.
+**Using it in your own project**: clone it as a folder named
+`yash_dhan_auth` next to your strategy folders, add the parent folder to
+`sys.path` as shown in §3, run `credentials_setup.py` once, and call
+`get_client()`. `verify.py` finds every sibling folder that imports the
+package on its own. MIT licensed.
 
 ```bash
 git clone https://github.com/yashpatel-py/dhanhq-auto-auth.git yash_dhan_auth
@@ -160,8 +157,8 @@ d20  = depth_feed([(1, "1333"), (1, "1333")], level=20)     # ≤50 instruments 
 d200 = depth_feed([(1, "1333")], level=200)                 # ONE instrument per socket
 ```
 
-If you run your own feed loop (hma_vwap and premium_harvester do), give it a
-token provider so every reconnect uses the **current** token:
+If you run your own feed loop instead of the SDK's, give it a token
+provider so every reconnect uses the **current** token:
 
 ```python
 from yash_dhan_auth import get_valid_token_with_retry
@@ -308,7 +305,7 @@ The rule, enforced by the package:
 [Environment]::SetEnvironmentVariable("YASH_DHAN_AUTH_NO_LOGIN", "1", "User")
 ```
 
-When the laptop does need Dhan data for a day (an `alpha_lab` pull, a
+When the laptop does need Dhan data for a day (a historical pull, a
 `verify.py` run), copy **today's** `.dhan_token.json` from the server into
 `yash_dhan_auth/` here and work read-only on it (`verify.py --no-login`); it
 dies on its own after 24 h. Copy it over scp / a password manager — never
