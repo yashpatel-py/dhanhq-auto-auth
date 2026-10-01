@@ -1,20 +1,22 @@
-"""Prove that ONE Dhan login serves every strategy under strategy_by_ai/.
+"""Prove that ONE Dhan login serves every strategy — and that Dhan serves
+every Data-API capability the plan pays for.
 
-    python verify.py            # full check (may perform a real login)
-    python verify.py --no-login # fail instead of logging in if no valid token
+    python verify.py              # full check (logs in only if no valid token exists)
+    python verify.py --no-login   # never log in: fail instead
+    python verify.py --no-ws      # skip the three WebSocket probes
+    python verify.py --quick      # token + account only; no capability probes, no strategies
 
-Checks, in order:
-  1. credentials + token files are where the shared package expects them
-  2. get_valid_token() returns a token Dhan actually accepts (user_profile),
-     and Dhan serves market data to it (one LTP quote)
-  3. skew_hunter, in its OWN process, resolves the same token file and token
-  4. swing_dual_momentum, in its OWN process, resolves the same token
-  5. dhan-nifty-options-paper-strategy resolves the same token
-  6. no strategy triggered a second login (the token is unchanged)
+Sections:
+  1. the shared package: credentials present, token on disk, decoded offline
+  2. Dhan accepts the token (/profile) — token validity, segments, data plan, static IP
+  3. the six Data-API capabilities, each asked directly (capabilities.py)
+  4. every strategy that imports this package, run in its OWN process the way
+     it really runs, lands on the same token file and the same token
+  5. none of them triggered a second login
 
-Steps 3/4/5 run as subprocesses on purpose: that is how the strategies really
-run, and it is the only way to catch two of them logging in separately and
-invalidating each other's token.
+Strategies are discovered by scanning strategy_by_ai/ for files that import
+yash_dhan_auth; known ones get a probe that goes through their own client
+code, unknown ones are listed so a probe can be added here.
 
 Read-only against Dhan — never places an order.
 """
@@ -34,20 +36,27 @@ if _PARENT not in sys.path:
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
+except Exception:                                # noqa: BLE001
     pass
 
-from yash_dhan_auth import (CREDS_FILE, TOKEN_FILE, data_access,     # noqa: E402
-                            token_type, validate_token)
+from yash_dhan_auth import (CREDS_FILE, TOKEN_FILE, check_capabilities,      # noqa: E402
+                            check_token, market_open_now, rest_headers, token_info)
+from yash_dhan_auth.token_manager import API_BASE, _json, _request             # noqa: E402
 
-OK, BAD = "  [ OK ]", "  [FAIL]"
+OK, BAD, UNK = "  [ OK ]", "  [FAIL]", "  [ ?? ]"
 _results: list[bool] = []
+_unknown = 0
 
 
-def check(label: str, passed: bool, detail: str = "") -> bool:
-    _results.append(passed)
+def check(label: str, passed: bool | None, detail: str = "") -> bool:
+    global _unknown
+    if passed is None:
+        _unknown += 1
+        print(f"{UNK} {label}" + (f"  — {detail}" if detail else ""))
+        return False
+    _results.append(bool(passed))
     print(f"{OK if passed else BAD} {label}" + (f"  — {detail}" if detail else ""))
-    return passed
+    return bool(passed)
 
 
 def fingerprint(token: str) -> str:
@@ -55,59 +64,94 @@ def fingerprint(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()[:16]
 
 
-# Printed by each strategy subprocess as the last line of stdout.
+# ══════════════════════════════════════════════════════════════════════════
+# strategies — each probe runs the strategy's OWN client code in a subprocess
+# ══════════════════════════════════════════════════════════════════════════
 _PROBE = """
-import json, sys
-sys.path.insert(0, {root!r})
-import os; os.chdir({root!r})
+import json, os, sys
+sys.path.insert(0, {root!r}); sys.path.insert(0, {parent!r}); os.chdir({root!r})
+import logging; logging.basicConfig(level=logging.WARNING)
 {importer}
-print("PROBE " + json.dumps({{"token_file": tf, "client_id": cid, "token": tok}}))
+from yash_dhan_auth import TOKEN_FILE as tf
+print("PROBE " + json.dumps({{"token_file": tf, "client_id": str(cid), "token": tok}}))
 """
 
-_SKEW_IMPORT = """
-from auth.token_manager import TOKEN_FILE as tf, get_valid_token_with_retry
-cid, tok = get_valid_token_with_retry()
-"""
+# folder -> the lines that obtain (cid, tok) exactly the way the strategy does
+KNOWN = {
+    "alpha_lab": """
+from data.dhan_history import get_client          # candle downloader's own client
+c = get_client()
+cid, tok = c.dhan_http.client_id, c.dhan_http.access_token
+""",
+    "hma_vwap": """
+from core import market                           # REST auth + the feed's credentials()
+cid, tok = market.credentials()
+""",
+    "premium_harvester": """
+from live.dhan_client import Dhan                 # the paper trader's rate-limited wrapper
+d = Dhan()
+cid, tok = d.client_id, d._token
+""",
+    "filings_feed": """
+from core.book import _dhan_client                # holdings/positions book
+c = _dhan_client()
+cid, tok = c.dhan_http.client_id, c.dhan_http.access_token
+""",
+}
 
-# Order matters and mirrors the real strategy: importing dhan_data is what
-# puts strategy_by_ai/ on sys.path, so the shared package is only importable
-# afterwards. swing exposes the token only through that package.
-_SWING_IMPORT = """
-import dhan_data
-dhan_data.get_client()          # the real client the strategy would trade with
-from yash_dhan_auth import TOKEN_FILE as tf, get_valid_token_with_retry
-cid, tok = get_valid_token_with_retry()
-"""
-
-_NIFTY_PAPER_IMPORT = """
-from strategy.dhan_data import get_client
-from strategy.settings import DhanSettings
-get_client(DhanSettings.from_env())  # read-only client; paper controls stay enforced
-from yash_dhan_auth import TOKEN_FILE as tf, get_valid_token_with_retry
-cid, tok = get_valid_token_with_retry()
-"""
+_SKIP_DIRS = {".venv", "venv", "__pycache__", ".git", "logs", "node_modules",
+              os.path.basename(_PKG_DIR), "yash_kotak_auth"}
 
 
-def probe(name: str, root: str, importer: str) -> dict | None:
-    """Run a strategy's own auth path in a separate process."""
-    code = _PROBE.format(root=root, importer=importer)
-    p = subprocess.run([sys.executable, "-c", code], capture_output=True,
-                       text=True, cwd=root, timeout=300)
+def discover_consumers() -> list[str]:
+    """Sibling folders whose .py files import yash_dhan_auth."""
+    found = []
+    for name in sorted(os.listdir(_PARENT)):
+        folder = os.path.join(_PARENT, name)
+        if name in _SKIP_DIRS or not os.path.isdir(folder):
+            continue
+        for dirpath, dirnames, filenames in os.walk(folder):
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
+            for fn in filenames:
+                if fn.endswith(".py"):
+                    try:
+                        with open(os.path.join(dirpath, fn), encoding="utf-8", errors="ignore") as f:
+                            if "yash_dhan_auth" in f.read():
+                                found.append(name)
+                                break
+                    except OSError:
+                        pass
+            if found and found[-1] == name:
+                break
+    return found
+
+
+def probe(name: str, importer: str) -> dict | None:
+    root = os.path.join(_PARENT, name)
+    code = _PROBE.format(root=root, parent=_PARENT, importer=importer)
+    try:
+        p = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                           text=True, cwd=root, timeout=300)
+    except subprocess.TimeoutExpired:
+        print(f"{BAD} {name}: probe timed out after 300s")
+        _results.append(False)
+        return None
     for line in reversed(p.stdout.splitlines()):
         if line.startswith("PROBE "):
             return json.loads(line[6:])
     print(f"{BAD} {name}: probe produced no result")
-    tail = (p.stderr or p.stdout).strip().splitlines()[-4:]
-    for t in tail:
+    for t in (p.stderr or p.stdout).strip().splitlines()[-5:]:
         print(f"         {t}")
     _results.append(False)
     return None
 
 
+# ══════════════════════════════════════════════════════════════════════════
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--no-login", action="store_true",
-                    help="fail instead of performing a login")
+    ap.add_argument("--no-login", action="store_true", help="fail instead of performing a login")
+    ap.add_argument("--no-ws", action="store_true", help="skip the WebSocket capability probes")
+    ap.add_argument("--quick", action="store_true", help="token + account only")
     args = ap.parse_args()
 
     print("Shared Dhan auth — verification\n")
@@ -116,77 +160,101 @@ def main() -> int:
     print(f"token   : {TOKEN_FILE}\n")
 
     print("1) Shared package")
-    check("credentials file present", os.path.exists(CREDS_FILE))
-    if not os.path.exists(CREDS_FILE):
+    if not check("credentials file present", os.path.exists(CREDS_FILE)):
         print("\n       Run: python credentials_setup.py")
         return 1
+    info = token_info()
+    check("token file present and readable", info is not None,
+          "" if info else "no token yet — the first strategy to run will log in")
+    if info:
+        check("token is from today (IST) and not near expiry", info["usable"],
+              f"type {info['token_type'] or '?'}, generated {info['generated_at']}, "
+              f"expires {info['expires_at']} ({(info['seconds_left'] or 0) // 3600}h left)")
 
-    print("\n2) Token is valid against Dhan")
+    print("\n2) Dhan accepts the token")
     if args.no_login:
-        if not os.path.exists(TOKEN_FILE):
-            check("token file present", False, "--no-login and no token on disk")
+        if not info:
+            check("token on disk", False, "--no-login and no token")
             return 1
         saved = json.load(open(TOKEN_FILE))
         cid, tok = saved["client_id"], saved["access_token"]
     else:
-        from yash_dhan_auth import get_valid_token_with_retry
-        cid, tok = get_valid_token_with_retry()
-    check("Dhan accepts the token (user_profile)", validate_token(cid, tok),
-          f"client {cid}, token {fingerprint(tok)}, type {token_type(tok) or '?'}")
-    ok, why = data_access(cid, tok)
-    check("Dhan serves market data to it (one LTP quote)", ok, why)
+        from yash_dhan_auth import LoginDisabled, get_valid_token_with_retry, login_disabled
+        if login_disabled():
+            print("         YASH_DHAN_AUTH_NO_LOGIN=1: this machine never logs in — using the token on disk")
+        try:
+            cid, tok = get_valid_token_with_retry()
+        except LoginDisabled as e:
+            check("usable token on disk", False, str(e))
+            return summary()
+    status, detail = check_token(cid, tok)
+    profile = detail if isinstance(detail, dict) else {}
+    check("Dhan accepts the token (/v2/profile)", status == "valid",
+          f"client {cid}, token {fingerprint(tok)}" if status == "valid" else f"{status}: {detail}")
+    if profile:
+        print(f"         token valid till {profile.get('tokenValidity')} | segments {profile.get('activeSegment')}"
+              f" | DDPI {profile.get('ddpi')} | MTF {profile.get('mtf')}")
+        check("Data API plan active on the account",
+              str(profile.get("dataPlan", "")).lower() == "active",
+              f"dataPlan {profile.get('dataPlan')}, valid till {profile.get('dataValidity')}")
+    try:
+        r = _request("GET", f"{API_BASE}/ip/getIP", headers=rest_headers(cid, tok), timeout=15)
+        ip = _json(r) if r.status_code == 200 else {}
+        check("static IP whitelisted for order APIs", bool(ip.get("ordersAllowed")) if ip else None,
+              (f"detected {ip.get('detectedIP')} → {ip.get('ipMatchStatus')} "
+               f"(primary {ip.get('primaryIP')}, secondary {ip.get('secondaryIP')})") if ip
+              else f"HTTP {r.status_code}: {r.text[:100]}")
+    except Exception as e:                       # noqa: BLE001
+        check("static IP whitelisted for order APIs", None, str(e)[:120])
     base = fingerprint(tok)
 
-    print("\n3) skew_hunter (own process, via its auth/ shim)")
-    skew = probe("skew_hunter", os.path.join(_PARENT, "skew_hunter"), _SKEW_IMPORT)
-    if skew:
-        check("resolves the shared token file",
-              os.path.normcase(skew["token_file"]) == os.path.normcase(TOKEN_FILE),
-              skew["token_file"])
-        check("gets the same token", fingerprint(skew["token"]) == base,
-              fingerprint(skew["token"]))
-        check("same client id", skew["client_id"] == cid, skew["client_id"])
+    if args.quick:
+        return summary()
 
-    print("\n4) swing_dual_momentum (own process, via dhan_data.py)")
-    swing = probe("swing_dual_momentum",
-                  os.path.join(_PARENT, "swing_dual_momentum"), _SWING_IMPORT)
-    if swing:
-        check("resolves the shared token file",
-              os.path.normcase(swing["token_file"]) == os.path.normcase(TOKEN_FILE),
-              swing["token_file"])
-        check("gets the same token", fingerprint(swing["token"]) == base,
-              fingerprint(swing["token"]))
-        check("same client id", swing["client_id"] == cid, swing["client_id"])
+    print(f"\n3) Data-API capabilities (market {'OPEN' if market_open_now() else 'closed'} — "
+          f"WebSocket silence is inconclusive when closed)")
+    if status != "valid":
+        print("         skipped — Dhan does not accept the token")
+    else:
+        for cap in check_capabilities(cid, tok, websockets=not args.no_ws):
+            check(f"{cap.name}", cap.ok, f"{cap.endpoint} — {cap.detail}")
 
-    print("\n5) dhan-nifty-options-paper-strategy (own process, via strategy.dhan_data)")
-    nifty_paper = probe(
-        "dhan-nifty-options-paper-strategy",
-        os.path.join(_PARENT, "dhan-nifty-options-paper-strategy"),
-        _NIFTY_PAPER_IMPORT,
-    )
-    if nifty_paper:
-        check("resolves the shared token file",
-              os.path.normcase(nifty_paper["token_file"]) == os.path.normcase(TOKEN_FILE),
-              nifty_paper["token_file"])
-        check("gets the same token", fingerprint(nifty_paper["token"]) == base,
-              fingerprint(nifty_paper["token"]))
-        check("same client id", nifty_paper["client_id"] == cid,
-              nifty_paper["client_id"])
+    print("\n4) Strategies, each in its own process")
+    consumers = discover_consumers()
+    if status != "valid":
+        print("         skipped — a strategy would try to log in with a token Dhan rejects")
+    elif not consumers:
+        print("         no sibling folder imports yash_dhan_auth")
+    for name in consumers if status == "valid" else []:
+        importer = KNOWN.get(name)
+        if not importer:
+            check(f"{name}", None, "imports the package but has no probe here — add one to KNOWN in verify.py")
+            continue
+        res = probe(name, importer)
+        if not res:
+            continue
+        same_file = os.path.normcase(res["token_file"]) == os.path.normcase(TOKEN_FILE)
+        same_tok = fingerprint(res["token"]) == base
+        check(f"{name}: shared token file, same token, same client",
+              same_file and same_tok and res["client_id"] == str(cid),
+              f"{fingerprint(res['token'])}" + ("" if same_file else f" — DIFFERENT FILE {res['token_file']}"))
 
-    print("\n6) No strategy triggered a second login")
-    final = json.load(open(TOKEN_FILE))
-    check("token on disk unchanged after all strategies ran",
-          fingerprint(final["access_token"]) == base,
-          f"{base} (one login serves all)")
-    check("token still accepted by Dhan",
-          validate_token(final["client_id"], final["access_token"]))
+    print("\n5) No strategy triggered a second login")
+    if os.path.exists(TOKEN_FILE):
+        final = json.load(open(TOKEN_FILE))
+        check("token on disk unchanged after all strategies ran",
+              fingerprint(final["access_token"]) == base, f"{base} (one login serves all)")
+    return summary()
 
+
+def summary() -> int:
     failed = _results.count(False)
     print("\n" + "─" * 62)
+    extra = f" ({_unknown} inconclusive)" if _unknown else ""
     if failed:
-        print(f"{failed} of {len(_results)} checks FAILED")
+        print(f"{failed} of {len(_results)} checks FAILED{extra}")
         return 1
-    print(f"All {len(_results)} checks passed — one login authenticates every strategy.")
+    print(f"All {len(_results)} checks passed{extra} — one login authenticates every strategy.")
     return 0
 
 
