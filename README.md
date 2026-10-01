@@ -28,6 +28,17 @@ strategy_by_ai/
 Needs `dhanhq>=2.2.0`, `pyotp`, `requests`, `websockets` — all pulled in by
 any strategy's `requirements.txt`; the package has none of its own.
 
+**Using it in your own project** (anyone, not just this tree): clone it as a
+folder named `yash_dhan_auth` next to your strategy folders, add the parent
+folder to `sys.path` as shown in §3, run `credentials_setup.py` once, and
+call `get_client()`. Nothing in it is specific to the strategies above; they
+are listed only because `verify.py` probes them. MIT licensed.
+
+```bash
+git clone https://github.com/yashpatel-py/dhanhq-auto-auth.git yash_dhan_auth
+pip install "dhanhq>=2.2.0" pyotp requests websockets
+```
+
 ---
 
 ## 1. First-time setup — once per machine
@@ -35,7 +46,7 @@ any strategy's `requirements.txt`; the package has none of its own.
 Already done on this machine. On a **new** machine:
 
 ```bash
-cd C:\Users\yashp\OneDrive\Desktop\strategy_by_ai\yash_dhan_auth
+cd <your>\strategy_by_ai\yash_dhan_auth
 ..\.venv\Scripts\python.exe credentials_setup.py --test-login
 ```
 
@@ -55,7 +66,7 @@ checked and replaced automatically — you never run a "log in" command.
 ## 2. Check it is working
 
 ```bash
-cd C:\Users\yashp\OneDrive\Desktop\strategy_by_ai\yash_dhan_auth
+cd <your>\strategy_by_ai\yash_dhan_auth
 ..\.venv\Scripts\python.exe verify.py
 ```
 
@@ -319,7 +330,7 @@ is the whole point of the split.
 
 ```bash
 cd <wherever>/strategy_by_ai
-git clone https://github.com/yashpatel-py/yash-dhan-auth.git yash_dhan_auth
+git clone https://github.com/yashpatel-py/dhanhq-auto-auth.git yash_dhan_auth
 # ...clone the strategies you run there, then install one of their requirements.txt
 ```
 
@@ -371,7 +382,7 @@ generates a fresh token on first use.
 ## 12. Tests
 
 ```bash
-cd C:\Users\yashp\OneDrive\Desktop\strategy_by_ai\yash_dhan_auth
+cd <your>\strategy_by_ai\yash_dhan_auth
 ..\.venv\Scripts\python.exe -m unittest discover tests
 ```
 
