@@ -61,17 +61,24 @@ def market_open_now(now: datetime | None = None) -> bool:
 # REST
 # ══════════════════════════════════════════════════════════════════════════
 def _rest(headers: dict, path: str, payload: dict, timeout: int = 60) -> tuple[bool | None, str, dict | None]:
-    """(ok, detail, body). Entitlement, rate-limit and auth answers are told apart."""
-    try:
-        r = _request("POST", f"{API_BASE}{path}", json=payload, headers=headers, timeout=timeout)
-    except DhanUnreachable as e:
-        return None, f"no answer: {e}", None
+    """(ok, detail, body). Entitlement, rate-limit and auth answers are told apart.
+    A rate-limit answer is retried once after a pause — it says nothing about
+    entitlement, and the first data call of a run often hits one."""
+    for attempt in (1, 2):
+        try:
+            r = _request("POST", f"{API_BASE}{path}", json=payload, headers=headers, timeout=timeout)
+        except DhanUnreachable as e:
+            return None, f"no answer: {e}", None
+        text = r.text
+        if (r.status_code == 429 or '"805"' in text or "DH-904" in text) and attempt == 1:
+            time.sleep(3.0)
+            continue
+        break
     body = _json(r)
-    text = r.text
     if r.status_code == 200:
         return True, "served", body if isinstance(body, dict) else None
     if r.status_code == 429 or '"805"' in text or "DH-904" in text:
-        return None, f"rate limited (HTTP {r.status_code}) — probe too fast, not an answer", None
+        return None, f"rate limited twice (HTTP {r.status_code}) — not an entitlement answer", None
     if "806" in text or "DH-902" in text or "not subscribed" in text.lower():
         return False, f"HTTP {r.status_code}: Data APIs refused (806 / DH-902) — entitlement on Dhan's side", None
     if "DH-901" in text or "807" in text or "809" in text:
