@@ -3,6 +3,8 @@ One-time setup: saves Dhan credentials for automatic token generation.
 
     python credentials_setup.py                # interactive; refuses to overwrite silently
     python credentials_setup.py --test-login   # ...then performs one real PIN+TOTP login
+    python credentials_setup.py --code         # current 6-digit TOTP code from the saved secret
+                                               # (Dhan's "Setup TOTP" step 2 and manual logins ask for it)
 
 The TOTP secret is the base32 string Dhan shows when you enable TOTP
 (web.dhan.co -> DhanHQ Trading APIs -> Setup TOTP), the same one you scan
@@ -110,8 +112,29 @@ def setup(test_login: bool = False) -> int:
     return 0
 
 
+def show_code() -> int:
+    """Print the current TOTP code (and the next one) from the saved secret —
+    what Dhan's TOTP setup page asks for in step 2, and what a manual login
+    on web.dhan.co asks for. It is a 30-second code; nothing else is shown."""
+    import time
+    if not os.path.exists(CREDS_FILE):
+        print(f"  No credentials file: {CREDS_FILE}\n  Run: python credentials_setup.py")
+        return 1
+    import pyotp
+    with open(CREDS_FILE) as f:
+        totp = pyotp.TOTP(json.load(f)["totp_secret"])
+    now = time.time()
+    left = 30 - int(now) % 30
+    print(f"  TOTP now : {totp.now()}   (valid for {left}s more)")
+    print(f"  then     : {totp.at(now + 30)}")
+    return 0
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--test-login", action="store_true",
                     help="after saving, perform one real PIN+TOTP login to prove the credentials")
-    sys.exit(setup(test_login=ap.parse_args().test_login))
+    ap.add_argument("--code", action="store_true",
+                    help="print the current 6-digit TOTP code from the saved secret and exit")
+    args = ap.parse_args()
+    sys.exit(show_code() if args.code else setup(test_login=args.test_login))
