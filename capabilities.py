@@ -96,6 +96,26 @@ def _data(body: dict | None) -> dict:
     return d if isinstance(d, dict) else {}
 
 
+def _series(body: dict | None) -> dict:
+    """The dict holding the candle arrays, wherever Dhan put it (seen 2026-10-02):
+
+      /charts/historical, /charts/intraday   {open:[], high:[], ..., timestamp:[]}   top level
+      /charts/rollingoption                  {data: {ce: {..., timestamp:[]}, pe: None}}
+      the SDK's envelope around either       {status, remarks, data: <one of the above>}
+    """
+    d = body if isinstance(body, dict) else {}
+    for _ in range(3):
+        if "timestamp" in d:
+            return d
+        for leg in ("ce", "pe"):
+            if isinstance(d.get(leg), dict) and "timestamp" in d[leg]:
+                return d[leg]
+        if not isinstance(d.get("data"), dict):
+            break
+        d = d["data"]
+    return {}
+
+
 def _rest_capabilities(headers: dict, today: date) -> list[Capability]:
     out: list[Capability] = []
 
@@ -110,7 +130,7 @@ def _rest_capabilities(headers: dict, today: date) -> list[Capability]:
         "securityId": str(NIFTY), "exchangeSegment": "IDX_I", "instrument": "INDEX",
         "expiryCode": 0, "oi": False, "fromDate": five_years.isoformat(), "toDate": today.isoformat()})
     if ok:
-        ts = _data(body).get("timestamp") or []
+        ts = _series(body).get("timestamp") or []
         if ts:
             first = datetime.fromtimestamp(ts[0], IST).date()
             span = (today - first).days / 365.25
@@ -126,7 +146,8 @@ def _rest_capabilities(headers: dict, today: date) -> list[Capability]:
         "securityId": str(NIFTY), "exchangeSegment": "IDX_I", "instrument": "INDEX", "interval": 5,
         "oi": False, "fromDate": (today - timedelta(days=6)).isoformat(), "toDate": today.isoformat()})
     if ok:
-        why = f"served — {len(_data(body).get('timestamp') or [])} 5-minute candles over the last 6 days"
+        n = len(_series(body).get("timestamp") or [])
+        ok, why = (True, f"served — {n} 5-minute candles over the last 6 days") if n else (False, "served an empty series")
     out.append(Capability("Historical Data — intraday minutes", "POST /charts/intraday", ok, why))
     time.sleep(REST_GAP)
 
@@ -160,7 +181,8 @@ def _rest_capabilities(headers: dict, today: date) -> list[Capability]:
         "requiredData": ["open", "high", "low", "close", "iv", "oi", "strike", "spot"],
         "fromDate": (today - timedelta(days=12)).isoformat(), "toDate": today.isoformat(), "interval": 5})
     if ok:
-        why = f"served — {len(_data(body).get('timestamp') or _data(body).get('close') or [])} ATM-call candles"
+        n = len(_series(body).get("timestamp") or [])
+        ok, why = (True, f"served — {n} ATM-call 5-minute candles over 12 days") if n else (False, "served an empty series")
     out.append(Capability("Expired Options Data (rolling ATM, NIFTY)", "POST /charts/rollingoption", ok, why))
     return out
 

@@ -441,6 +441,20 @@ class CapabilityTests(unittest.TestCase):
             ok, _, body = caps._rest({}, "/x", {})
         self.assertTrue(ok); self.assertEqual(caps._data(body), {"oc": {}})
 
+    def test_series_is_found_in_every_shape_dhan_uses(self):
+        candles = {"open": [1.0], "close": [2.0], "timestamp": [1790793000.0]}
+        # /charts/historical and /charts/intraday: arrays at the top level
+        self.assertEqual(caps._series(candles)["timestamp"], [1790793000.0])
+        # /charts/rollingoption: nested under data.ce (pe is None for a CALL request)
+        self.assertEqual(caps._series({"data": {"ce": candles, "pe": None}})["close"], [2.0])
+        self.assertEqual(caps._series({"data": {"ce": None, "pe": candles}})["open"], [1.0])
+        # the SDK's envelope around either
+        self.assertEqual(caps._series({"status": "success", "remarks": "", "data": candles}), candles)
+        self.assertEqual(caps._series({"status": "success", "data": {"data": {"ce": candles}}}), candles)
+        # nothing recognisable -> empty, never a crash
+        for junk in (None, {}, {"data": None}, {"data": {"oc": {}}}, {"data": "x"}):
+            self.assertEqual(caps._series(junk), {})
+
     def test_disconnect_packet(self):
         import struct
         self.assertEqual(caps._disconnect_reason(struct.pack("<BHBIH", 50, 10, 1, 1333, 806)), 806)
