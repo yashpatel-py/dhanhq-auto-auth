@@ -16,6 +16,7 @@ from .token_manager import (          # noqa: F401
     IST,
     TokenError,
     CredentialsRejected,
+    LoginCoolingDown,
     TokenMintThrottled,
     DhanUnreachable,
     LoginDisabled,

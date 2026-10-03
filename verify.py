@@ -102,6 +102,12 @@ from core.book import _dhan_client                # holdings/positions book
 c = _dhan_client()
 cid, tok = c.dhan_http.client_id, c.dhan_http.access_token
 """,
+    "intraday_edge": """
+from live.dhan_io import DhanIO                   # asks the package at every call, caches nothing
+io = DhanIO()
+cid, tok = io.identity()
+assert io.api.dhan_http.access_token == tok
+""",
 }
 
 _SKIP_DIRS = {".venv", "venv", "__pycache__", ".git", "logs", "node_modules",

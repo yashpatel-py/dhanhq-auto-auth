@@ -3,6 +3,7 @@
 .dhan_credentials.json
 .dhan_token.json
 .dhan_token.lock
+.dhan_login_state.json
 *.tmp
 __pycache__/
 *.pyc

@@ -55,6 +55,7 @@ _PKG_DIR = os.path.abspath(os.path.dirname(__file__))
 CREDS_FILE = os.path.join(_PKG_DIR, ".dhan_credentials.json")
 TOKEN_FILE = os.path.join(_PKG_DIR, ".dhan_token.json")
 LOCK_FILE = os.path.join(_PKG_DIR, ".dhan_token.lock")
+STATE_FILE = os.path.join(_PKG_DIR, ".dhan_login_state.json")   # last TOTP window used, cool-down — no secrets
 
 AUTH_BASE = "https://auth.dhan.co"
 API_BASE = "https://api.dhan.co/v2"
@@ -70,6 +71,20 @@ LOCK_WAIT_SEC = 300
 VALIDATION_TTL_SEC = 120     # re-ask /profile about the same token at most this often (per process)
 MINT_GAP_SEC = 120           # Dhan: "Token can be generated once every 2 minutes"
 EXPIRY_MARGIN_SEC = 300      # treat a token as dead 5 min before its JWT exp
+
+# TOTP timing. On 2026-10-04 at 00:00 IST Dhan answered "Invalid TOTP" five
+# times in 90 s to codes from a secret that then logged in at 00:01:31 — the
+# codes had been sent 1-2 s into their 30 s window, and two of them were a
+# code the other strategy had already submitted. So: send a code only when its
+# window is SEND_EARLIEST..SEND_LATEST seconds old, never submit one window's
+# code twice (across processes — STATE_FILE), try TOTP_ATTEMPTS distinct
+# windows before calling it a rejection, and after a rejected round make every
+# process wait out a shared cool-down instead of each adding its own attempts.
+TOTP_STEP = 30
+SEND_EARLIEST = 5
+SEND_LATEST = 25
+TOTP_ATTEMPTS = 3
+REJECT_COOLDOWNS = (120, 300, 900, 1800)     # seconds, by consecutive rejected rounds
 
 # Set this (=1) on a machine that must NEVER log in — e.g. the laptop while
 # the server runs the strategies. Dhan keeps one live token per client, so a
@@ -111,6 +126,17 @@ class TokenMintThrottled(TokenError):
 class DhanUnreachable(TokenError):
     """Network error, timeout, 429 or 5xx — Dhan did not answer the question.
     Says nothing about the token."""
+
+
+class LoginCoolingDown(CredentialsRejected):
+    """Dhan rejected a full round of TOTP codes a moment ago (this process or
+    another one). No login is attempted until `retry_after` seconds pass, so
+    several strategies cannot stack failed logins on one account. Changing
+    .dhan_credentials.json clears it at once."""
+
+    def __init__(self, msg: str, retry_after: float):
+        super().__init__(msg)
+        self.retry_after = retry_after
 
 
 class LoginDisabled(TokenError):
@@ -422,13 +448,67 @@ def _classify_profile(status: int, body) -> str:
 # ══════════════════════════════════════════════════════════════════════════
 # login / renew / check
 # ══════════════════════════════════════════════════════════════════════════
+def _read_state() -> dict:
+    try:
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:                            # noqa: BLE001 — absent or half-written: start clean
+        return {}
+
+
+def _write_state(state: dict) -> None:
+    try:
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, STATE_FILE)
+    except OSError as e:
+        logger.debug(f"Could not write {STATE_FILE}: {e}")
+
+
+def _creds_mtime() -> float:
+    try:
+        return os.path.getmtime(CREDS_FILE)
+    except OSError:
+        return 0.0
+
+
+def _next_send_time(now: float, offset: float, last_step: int) -> float:
+    """Earliest local time >= `now` at which a TOTP code may be sent.
+
+    By Dhan's clock (`now - offset`) the code's window must be SEND_EARLIEST
+    to SEND_LATEST seconds old — not at its edges — and must be a window whose
+    code has not been submitted before (`last_step` is the last one used, by
+    any process).
+    """
+    step, pos = divmod(now - offset, TOTP_STEP)
+    if step <= last_step:
+        return now + (TOTP_STEP - pos) + SEND_EARLIEST + (last_step - step) * TOTP_STEP
+    if pos < SEND_EARLIEST:
+        return now + (SEND_EARLIEST - pos)
+    if pos > SEND_LATEST:
+        return now + (TOTP_STEP - pos) + SEND_EARLIEST
+    return now
+
+
+def _clock_offset(resp, sent_at: float) -> float | None:
+    """This machine's clock minus Dhan's, in seconds, from a response's Date header."""
+    try:
+        from email.utils import parsedate_to_datetime
+        return sent_at - parsedate_to_datetime(resp.headers["Date"]).timestamp()
+    except Exception:                            # noqa: BLE001 — header absent or a fake response
+        return None
+
+
 def generate_token() -> tuple[str, str]:
     """Log in with PIN + TOTP. Returns (client_id, access_token).
 
-    One login, and ONE retry in the next 30 s window only if Dhan rejected
-    the code (clock drift / code expired in transit). Nothing else is
-    retried here: a wrong PIN raises CredentialsRejected, a login inside
-    Dhan's 2-minute gap raises TokenMintThrottled, a network error raises
+    Up to TOTP_ATTEMPTS codes, each from a different 30 s window and each sent
+    mid-window, never a code already submitted by another process. If Dhan
+    rejects them all it raises CredentialsRejected and starts a cool-down
+    shared by every process (LoginCoolingDown until it passes). A login inside
+    Dhan's 2-minute gap raises TokenMintThrottled, a network error
     DhanUnreachable — the caller decides what waiting is worth.
     """
     import pyotp
@@ -438,19 +518,38 @@ def generate_token() -> tuple[str, str]:
     client_id = str(creds["client_id"])
     totp = pyotp.TOTP(creds["totp_secret"].replace(" ", "").upper())
 
-    kind, last = "other", "no response"
-    for attempt in (1, 2):
-        # Never send a code that is about to roll over while in transit.
-        remaining = 30 - (time.time() % 30)
-        if remaining < 4:
-            time.sleep(remaining + 0.5)
-        code = totp.now()
-        logger.info(f"Logging in to Dhan for {client_id} (TOTP attempt {attempt}/2)")
+    state = _read_state()
+    creds_mtime = _creds_mtime()
+    if state.get("creds_mtime") != creds_mtime:
+        # credentials were (re)written since the last attempt: old rejections say nothing about them
+        state.update(rejected_rounds=0, cooldown_until=0, creds_mtime=creds_mtime)
+    cooling = float(state.get("cooldown_until") or 0) - time.time()
+    if cooling > 0:
+        raise LoginCoolingDown(
+            f"Dhan rejected the last {TOTP_ATTEMPTS} TOTP codes ({state.get('last_reject', '?')}); "
+            f"no login for another {cooling:.0f}s so that several strategies cannot stack failed "
+            f"logins. {_reject_hint(state)}", retry_after=cooling)
+
+    kind, last, offset, attempts = "other", "no response", 0.0, 0
+    for attempt in range(1, TOTP_ATTEMPTS + 1):
+        now = time.time()
+        send_at = _next_send_time(now, offset, int(state.get("last_step", -1)))
+        if send_at > now:
+            _touch_lock()
+            time.sleep(send_at - now)
+        dhan_time = send_at - offset
+        state.update(last_step=int(dhan_time // TOTP_STEP), last_attempt_at=_now_ist().isoformat())
+        _write_state(state)
+        logger.info(f"Logging in to Dhan for {client_id} (TOTP attempt {attempt}/{TOTP_ATTEMPTS})")
         resp = _request("POST", f"{AUTH_BASE}/app/generateAccessToken",
-                        params={"dhanClientId": client_id, "pin": str(creds["pin"]), "totp": code})
+                        params={"dhanClientId": client_id, "pin": str(creds["pin"]),
+                                "totp": totp.at(dhan_time)})
+        attempts = attempt
         body = _json(resp)
         token = _extract_token(body)
         if resp.status_code == 200 and token:
+            state.update(rejected_rounds=0, cooldown_until=0, last_success_at=_now_ist().isoformat())
+            _write_state(state)
             _save_token(client_id, token, body.get("expiryTime") if isinstance(body, dict) else None)
             logger.info("New access token generated successfully")
             return client_id, token
@@ -461,19 +560,42 @@ def generate_token() -> tuple[str, str]:
             raise TokenMintThrottled(f"Dhan refused the login: {last}")
         if kind == "unreachable":
             raise DhanUnreachable(f"Dhan did not answer the login: {last}")
-        if kind == "rejected" and attempt == 1:
-            wait = 30 - (time.time() % 30) + 1
-            logger.warning(f"Login rejected ({last}) — retrying once with the next TOTP code in {wait:.0f}s")
-            _touch_lock()
-            time.sleep(wait)
-            continue
-        break
+        if kind != "rejected":
+            break
+        seen = _clock_offset(resp, send_at)
+        if seen is not None:
+            state["clock_offset"] = round(seen, 1)
+            if abs(seen) > 3:
+                offset = seen                    # this clock is off: build the next code on Dhan's time
+        if attempt < TOTP_ATTEMPTS:
+            logger.warning(f"Login rejected ({last}) — trying the next TOTP window "
+                           f"(attempt {attempt + 1}/{TOTP_ATTEMPTS})")
 
     if kind == "rejected":
+        rounds = int(state.get("rejected_rounds") or 0) + 1
+        cooldown = REJECT_COOLDOWNS[min(rounds, len(REJECT_COOLDOWNS)) - 1]
+        state.update(rejected_rounds=rounds, cooldown_until=time.time() + cooldown,
+                     last_reject=last, creds_mtime=creds_mtime)
+        _write_state(state)
         raise CredentialsRejected(
-            f"Dhan rejected the PIN/TOTP twice: {last}. "
-            f"Check .dhan_credentials.json (python credentials_setup.py)")
+            f"Dhan rejected {attempts} TOTP codes from {attempts} different windows: {last}. "
+            f"{_reject_hint(state)} Next login attempt allowed in {cooldown}s.")
     raise TokenError(f"Token generation failed: {last}")
+
+
+def _reject_hint(state: dict) -> str:
+    """What a rejection most likely means, from what is known."""
+    parts = []
+    off = state.get("clock_offset")
+    if off is not None:
+        parts.append(f"This machine's clock is {off:+.1f}s against Dhan's"
+                     + (" — fix the system clock." if abs(off) > 25 else "."))
+    if state.get("last_success_at"):
+        parts.append(f"These credentials logged in successfully at {state['last_success_at']}, so "
+                     f"this is probably on Dhan's side or temporary; it will be retried.")
+    else:
+        parts.append("If the PIN or TOTP secret changed, run: python credentials_setup.py --test-login")
+    return " ".join(parts)
 
 
 def renew_token() -> tuple[str, str]:
@@ -675,14 +797,24 @@ def force_refresh(bad_token: str | None = None) -> tuple[str, str]:
 
 
 def get_valid_token_with_retry(max_retries: int = 3, delay: int = 30) -> tuple[str, str]:
-    """get_valid_token with retries. Waits out Dhan's 2-minute mint gap, and
-    does NOT retry a rejected PIN/TOTP (that only risks a lockout)."""
+    """get_valid_token with retries. Waits out Dhan's 2-minute mint gap and,
+    once, the first short cool-down after a rejected round of TOTP codes (Dhan
+    has rejected valid codes for a minute or two around midnight); a second
+    rejected round, or a longer cool-down, is raised to the caller."""
     last: Exception | None = None
+    waited_out_rejection = False
     for attempt in range(1, max_retries + 1):
         try:
             return get_valid_token()
-        except (CredentialsRejected, LoginDisabled):
+        except LoginDisabled:
             raise
+        except CredentialsRejected as e:
+            remaining = float(_read_state().get("cooldown_until") or 0) - time.time()
+            if (waited_out_rejection or attempt == max_retries
+                    or not 0 < remaining <= REJECT_COOLDOWNS[0] + 10):
+                raise
+            waited_out_rejection = True
+            last, wait = e, int(remaining) + 1
         except TokenMintThrottled as e:
             last, wait = e, max(delay, e.retry_after + 5)
         except Exception as e:                   # noqa: BLE001

@@ -68,6 +68,7 @@ class Base(unittest.TestCase):
             patch.object(tm, "TOKEN_FILE", os.path.join(d, ".dhan_token.json")),
             patch.object(tm, "LOCK_FILE", os.path.join(d, ".dhan_token.lock")),
             patch.object(tm, "CREDS_FILE", os.path.join(d, ".dhan_credentials.json")),
+            patch.object(tm, "STATE_FILE", os.path.join(d, ".dhan_login_state.json")),
             patch.object(tm, "restrict_permissions", lambda path: None),
         ]
         for p in self._patches:
@@ -192,13 +193,86 @@ class GenerateTokenTests(Base):
         self.assertTrue(saved["expires_at"])
         self.assertTrue(tm._recently_validated(tok), "a freshly issued token needs no /profile round-trip")
 
-    def test_rejected_code_is_retried_exactly_once_then_credentials_rejected(self):
-        with patch.object(tm, "_request", return_value=PROFILE_REJECT) as rq:
+    INVALID_TOTP = Resp(200, {"message": "Invalid TOTP", "status": "error"})   # Dhan's real answer, 2026-10-04
+
+    def test_send_time_is_mid_window_and_never_a_window_already_used(self):
+        nst = tm._next_send_time
+        base = 1_790_000_010.0                       # a multiple of 30: the start of a window
+        step = int(base // 30)
+        self.assertEqual(nst(base + 12, 0, -1), base + 12, "mid-window: send now")
+        self.assertEqual(nst(base + 1, 0, -1), base + 5, "1 s into a window: wait until it is 5 s old")
+        self.assertEqual(nst(base + 28, 0, -1), base + 35, "2 s before the edge: next window, 5 s in")
+        self.assertEqual(nst(base + 12, 0, step), base + 35, "this window's code was already submitted")
+        self.assertEqual(nst(base + 12, 0, step + 1), base + 65, "...and the next one too")
+        # this clock 20 s fast: Dhan is at base-8, i.e. 22 s into the PREVIOUS window -> fine to send
+        self.assertEqual(nst(base + 12, 20, -1), base + 12)
+        # this clock 10 s fast: Dhan is 2 s into the window -> wait 3 s
+        self.assertEqual(nst(base + 12, 10, -1), base + 15)
+
+    def test_three_different_windows_then_rejected_and_a_shared_cooldown(self):
+        with patch.object(tm, "_request", return_value=self.INVALID_TOTP) as rq:
+            with self.assertRaises(tm.CredentialsRejected) as cm:
+                tm.generate_token()
+            self.assertEqual(rq.call_count, tm.TOTP_ATTEMPTS)
+            self.assertNotIsInstance(cm.exception, tm.LoginCoolingDown)
+            self.assertIn("3 different windows", str(cm.exception))
+            codes = [c.kwargs["params"]["totp"] for c in rq.call_args_list]
+            self.assertEqual(len(set(codes)), 3, "no TOTP code was submitted twice")
+            # a second process arriving now must not add its own attempts
+            with self.assertRaises(tm.LoginCoolingDown) as cool:
+                tm.generate_token()
+            self.assertEqual(rq.call_count, tm.TOTP_ATTEMPTS, "no login while cooling down")
+        self.assertAlmostEqual(cool.exception.retry_after, tm.REJECT_COOLDOWNS[0], delta=3)
+        self.assertGreaterEqual(sum(self.sleeps), 45, "two further windows were waited for")
+        self.assertFalse(os.path.exists(tm.TOKEN_FILE))
+
+    def test_cooldown_grows_with_consecutive_rejected_rounds(self):
+        with patch.object(tm, "_request", return_value=self.INVALID_TOTP):
+            for expected in tm.REJECT_COOLDOWNS + (tm.REJECT_COOLDOWNS[-1],):
+                state = tm._read_state()
+                state["cooldown_until"] = 0          # pretend the previous cool-down has passed
+                tm._write_state(state)
+                with self.assertRaises(tm.CredentialsRejected):
+                    tm.generate_token()
+                self.assertAlmostEqual(tm._read_state()["cooldown_until"] - time.time(), expected, delta=3)
+
+    def test_new_credentials_clear_the_cooldown_at_once(self):
+        with patch.object(tm, "_request", return_value=self.INVALID_TOTP):
             with self.assertRaises(tm.CredentialsRejected):
                 tm.generate_token()
+        later = time.time() + 60
+        os.utime(tm.CREDS_FILE, (later, later))       # credentials_setup.py rewrote the file
+        tok = jwt(24)
+        with patch.object(tm, "_request", return_value=Resp(200, {"accessToken": tok})) as rq:
+            self.assertEqual(tm.generate_token(), ("1", tok))
+        self.assertEqual(rq.call_count, 1)
+        state = tm._read_state()
+        self.assertEqual(state["rejected_rounds"], 0)
+        self.assertTrue(state["last_success_at"])
+
+    def test_a_rejection_followed_by_success_in_the_next_window(self):
+        tok = jwt(24)
+        answers = [self.INVALID_TOTP, Resp(200, {"accessToken": tok})]
+        with patch.object(tm, "_request", side_effect=answers) as rq:
+            self.assertEqual(tm.generate_token(), ("1", tok))
         self.assertEqual(rq.call_count, 2)
-        self.assertTrue(any(s > 1 for s in self.sleeps), "waited for the next TOTP window before the retry")
-        self.assertFalse(os.path.exists(tm.TOKEN_FILE))
+        self.assertEqual(tm._read_state().get("cooldown_until"), 0)
+
+    def test_code_submitted_by_another_process_is_not_sent_again(self):
+        now_step = int(time.time() // 30)
+        tm._write_state({"last_step": now_step, "creds_mtime": tm._creds_mtime()})   # "the other strategy" just used it
+        tok = jwt(24)
+        with patch.object(tm, "_request", return_value=Resp(200, {"accessToken": tok})):
+            tm.generate_token()
+        self.assertGreater(tm._read_state()["last_step"], now_step)
+        self.assertTrue(self.sleeps and self.sleeps[0] >= 4, "waited for a fresh window")
+
+    def test_hint_says_transient_when_these_credentials_worked_before(self):
+        self.assertIn("credentials_setup.py", tm._reject_hint({}))
+        hint = tm._reject_hint({"last_success_at": "2026-10-04T00:01:31+05:30", "clock_offset": 0.4})
+        self.assertIn("probably on Dhan's side", hint)
+        self.assertIn("+0.4s", hint)
+        self.assertIn("fix the system clock", tm._reject_hint({"clock_offset": 41.0}))
 
     def test_mint_gap_raises_throttled_without_a_second_login(self):
         body = {"errorMessage": "Token can be generated once every 2 minutes"}
@@ -361,6 +435,28 @@ class RetryTests(Base):
                 tm.get_valid_token_with_retry()
         self.assertEqual(g.call_count, 1)
         self.assertEqual(self.sleeps, [])
+
+    def test_first_short_cooldown_is_waited_out_once(self):
+        tm._write_state({"cooldown_until": time.time() + 120})
+        with patch.object(tm, "get_valid_token",
+                          side_effect=[tm.CredentialsRejected("Invalid TOTP x3"), ("1", "t")]) as g:
+            self.assertEqual(tm.get_valid_token_with_retry(), ("1", "t"))
+        self.assertEqual(g.call_count, 2)
+        self.assertEqual(len(self.sleeps), 1)
+        self.assertAlmostEqual(self.sleeps[0], 121, delta=2)
+
+    def test_second_rejected_round_or_long_cooldown_is_raised(self):
+        tm._write_state({"cooldown_until": time.time() + 120})
+        with patch.object(tm, "get_valid_token", side_effect=tm.CredentialsRejected("Invalid TOTP")) as g:
+            with self.assertRaises(tm.CredentialsRejected):
+                tm.get_valid_token_with_retry()
+        self.assertEqual(g.call_count, 2, "waited once, then gave up")
+        self.sleeps.clear()
+        tm._write_state({"cooldown_until": time.time() + 900})
+        with patch.object(tm, "get_valid_token", side_effect=tm.LoginCoolingDown("cooling", 900)) as g:
+            with self.assertRaises(tm.LoginCoolingDown):
+                tm.get_valid_token_with_retry()
+        self.assertEqual((g.call_count, self.sleeps), (1, []))
 
     def test_mint_gap_is_waited_out(self):
         with patch.object(tm, "get_valid_token",
