@@ -37,6 +37,7 @@ import base64
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -386,12 +387,26 @@ def _login_lock(wait: int = LOCK_WAIT_SEC):
 # ══════════════════════════════════════════════════════════════════════════
 # HTTP — direct, with timeouts (dhanhq.DhanLogin has none and raises on non-200)
 # ══════════════════════════════════════════════════════════════════════════
+# generateAccessToken takes the Client ID, PIN and TOTP as QUERY parameters,
+# and requests/urllib3 quote the whole URL in DNS, connect and TLS errors
+# ("Max retries exceeded with url: /app/generateAccessToken?dhanClientId=..").
+_QUERY = re.compile(r"\?[^\s)'\"]*")
+_SECRET_PARAM = re.compile(r"\b(dhanClientId|clientId|pin|totp|token|access[-_]token)=[^&\s)'\"]*", re.I)
+
+
+def _redact(text: object) -> str:
+    """str(text) with every URL query string, and any stray pin= / totp= /
+    token= value, replaced by <redacted>. For text that is logged or raised."""
+    return _SECRET_PARAM.sub(r"\1=<redacted>", _QUERY.sub("?<redacted>", str(text)))
+
+
 def _request(method: str, url: str, **kw) -> requests.Response:
     kw.setdefault("timeout", HTTP_TIMEOUT)
     try:
         return requests.request(method, url, **kw)
     except requests.RequestException as e:
-        raise DhanUnreachable(f"{method} {url.split('?')[0]}: {type(e).__name__}: {e}") from e
+        # `from None`: a logged traceback would otherwise print `e` — query and all — as the cause
+        raise DhanUnreachable(f"{method} {url.split('?')[0]}: {type(e).__name__}: {_redact(e)}") from None
 
 
 def _json(resp: requests.Response):
@@ -554,8 +569,9 @@ def generate_token() -> tuple[str, str]:
             logger.info("New access token generated successfully")
             return client_id, token
 
-        last = _error_text(body, resp)
-        kind = _classify_login_error(resp.status_code, last)
+        text = _error_text(body, resp)
+        kind = _classify_login_error(resp.status_code, text)
+        last = _redact(text)                     # logged, raised and kept in STATE_FILE — an error page may echo our URL
         if kind == "throttled":
             raise TokenMintThrottled(f"Dhan refused the login: {last}")
         if kind == "unreachable":
@@ -819,11 +835,11 @@ def get_valid_token_with_retry(max_retries: int = 3, delay: int = 30) -> tuple[s
             last, wait = e, max(delay, e.retry_after + 5)
         except Exception as e:                   # noqa: BLE001
             last, wait = e, delay
-        logger.error(f"Token attempt {attempt}/{max_retries} failed: {last}")
+        logger.error(f"Token attempt {attempt}/{max_retries} failed: {_redact(last)}")
         if attempt < max_retries:
             logger.info(f"Retrying in {wait}s...")
             time.sleep(wait)
-    raise TokenError(f"Failed to obtain valid token after {max_retries} attempts: {last}")
+    raise TokenError(f"Failed to obtain valid token after {max_retries} attempts: {_redact(last)}")
 
 
 # ══════════════════════════════════════════════════════════════════════════

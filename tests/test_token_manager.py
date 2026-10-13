@@ -8,16 +8,24 @@ and credentials files live in a temp dir; time.sleep is recorded, not slept.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
+import socket
+import ssl
 import sys
 import tempfile
 import threading
 import time
+import traceback
 import unittest
 from datetime import datetime, timedelta
 from unittest.mock import patch
+from urllib.parse import urlencode
+
+import requests
+import urllib3
 
 _HERE = os.path.abspath(os.path.dirname(__file__))
 _PARENT = os.path.abspath(os.path.join(_HERE, "..", ".."))
@@ -471,6 +479,133 @@ class RetryTests(Base):
         self.assertEqual(self.sleeps, [7, 7])
 
 
+class NoSecretsInErrorsTests(Base):
+    """generateAccessToken takes the Client ID, PIN and TOTP as query
+    parameters, and requests/urllib3 quote that URL in full when DNS, connect
+    or TLS fails ("Max retries exceeded with url: /app/generateAccessToken?
+    dhanClientId=..&pin=..&totp=.."). None of it may reach an exception
+    message, a logged traceback or a log line. The Base credentials ("1",
+    "123456") are too short to search for, hence longer ones here."""
+
+    CID, PIN = "1104477210", "582913"
+
+    def setUp(self):
+        super().setUp()
+        with open(tm.CREDS_FILE, "w") as f:
+            json.dump({"client_id": self.CID, "pin": self.PIN, "totp_secret": SECRET}, f)
+        self.sent: list[dict] = []                # the params of every login actually attempted
+
+    def leaky_connection_error(self, method, url, **kw):
+        """requests' own wording for a DNS failure, query string and all."""
+        self.sent.append(kw["params"])
+        raise requests.exceptions.ConnectionError(
+            f"HTTPSConnectionPool(host='auth.dhan.co', port=443): Max retries exceeded with url: "
+            f"/app/generateAccessToken?{urlencode(kw['params'])} (Caused by NameResolutionError("
+            f"\"<urllib3.connection.HTTPSConnection object at 0x1F2E3D4C5B6A>: Failed to resolve "
+            f"'auth.dhan.co' ([Errno 11001] getaddrinfo failed)\"))")
+
+    def assert_no_secrets(self, exc: BaseException, logs: list[str] = ()):
+        codes = [p["totp"] for p in self.sent]
+        self.assertTrue(codes, "a login was attempted")
+        raised = "".join(traceback.format_exception(exc))          # message + any chained cause
+        logged = "\n".join(logs)
+        for secret in (self.CID, self.PIN, *codes):
+            self.assertNotIn(secret, raised)
+        for secret in (self.PIN, *codes):         # the Client ID is logged on purpose ("Logging in to Dhan for ...")
+            self.assertNotIn(secret, logged)
+        for text in (raised, logged):
+            self.assertNotIn("pin=", text)
+            self.assertNotIn("totp=", text)
+        if os.path.exists(tm.STATE_FILE):
+            with open(tm.STATE_FILE) as f:
+                state = f.read()
+            for secret in (self.PIN, *codes):
+                self.assertNotIn(secret, state)
+
+    def test_connection_error_text_is_redacted(self):
+        with patch.object(tm.requests, "request", side_effect=self.leaky_connection_error):
+            with self.assertLogs("auth.token_manager", level="DEBUG") as logs:
+                with self.assertRaises(tm.DhanUnreachable) as cm:
+                    tm.generate_token()
+        self.assert_no_secrets(cm.exception, logs.output)
+        msg = str(cm.exception)
+        self.assertIn("POST https://auth.dhan.co/app/generateAccessToken: ConnectionError:", msg)
+        self.assertIn("generateAccessToken?<redacted>", msg)
+        self.assertIn("getaddrinfo failed", msg, "the reason is kept — only the query goes")
+
+    def test_real_requests_errors_for_dns_connect_and_tls(self):
+        """The real requests + urllib3 stack, failing below the socket: their
+        message format, whatever the installed versions make of it."""
+        failures = {
+            "dns": patch("urllib3.util.connection.create_connection",
+                         side_effect=socket.gaierror(11001, "getaddrinfo failed")),
+            "connect": patch("urllib3.util.connection.create_connection",
+                             side_effect=ConnectionRefusedError(10061, "actively refused")),
+            "connect timeout": patch("urllib3.util.connection.create_connection",
+                                     side_effect=TimeoutError("timed out")),
+            "tls": patch.object(urllib3.connection.HTTPSConnection, "connect",
+                                side_effect=ssl.SSLError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] verify failed")),
+        }
+        for name, failure in failures.items():
+            with self.subTest(name), failure, \
+                    patch.object(tm.requests, "request", wraps=requests.request) as rq:
+                with self.assertRaises(tm.DhanUnreachable) as cm:
+                    tm.generate_token()
+                self.sent = [c.kwargs["params"] for c in rq.call_args_list]
+                cause = cm.exception.__context__
+                self.assertIsInstance(cause, requests.RequestException)
+                self.assertIn(f"pin={self.PIN}", str(cause), "the simulated failure really quotes the query")
+                self.assert_no_secrets(cm.exception)
+
+    def test_rest_headers_retry_path(self):
+        """What a strategy sees: rest_headers() -> get_valid_token_with_retry()
+        -> three failed logins -> TokenError, with an error logged per attempt."""
+        with patch.object(tm.requests, "request", side_effect=self.leaky_connection_error):
+            with self.assertLogs("auth.token_manager", level="DEBUG") as logs:
+                with self.assertRaises(tm.TokenError) as cm:
+                    tm.rest_headers()
+        self.assertEqual(len(self.sent), 3)
+        self.assertIn("Failed to obtain valid token after 3 attempts", str(cm.exception))
+        self.assertEqual(sum("failed: POST https://auth.dhan.co/app/generateAccessToken:" in o
+                             for o in logs.output), 3)
+        self.assert_no_secrets(cm.exception, logs.output)
+
+    def test_dhan_echoing_the_query_in_its_answer(self):
+        """A gateway error page, or a rejection, quoting the request URL back."""
+        def echo(status, body_of):
+            def answer(method, url, **kw):
+                self.sent.append(kw["params"])
+                return Resp(status, body_of(f"{url}?{urlencode(kw['params'])}"))
+            return answer
+
+        cases = {
+            "502 page": (echo(502, lambda u: f"<html>502 Bad Gateway for {u}</html>"), tm.DhanUnreachable),
+            "rejection": (echo(401, lambda u: {"errorMessage": f"Invalid TOTP ({u})"}), tm.CredentialsRejected),
+        }
+        for name, (answer, expected) in cases.items():
+            with self.subTest(name), patch.object(tm, "_request", side_effect=answer):
+                self.sent.clear()
+                tm._write_state({})
+                with self.assertLogs("auth.token_manager", level="DEBUG") as logs:
+                    with self.assertRaises(expected) as cm:
+                        tm.generate_token()
+                self.assert_no_secrets(cm.exception, logs.output)
+
+    def test_redact(self):
+        r = tm._redact
+        self.assertEqual(r("Max retries exceeded with url: /app/generateAccessToken?dhanClientId=1&pin=2&totp=3 "
+                           "(Caused by X)"),
+                         "Max retries exceeded with url: /app/generateAccessToken?<redacted> (Caused by X)")
+        self.assertEqual(r("wss://api-feed.dhan.co?version=2&token=eyJ.a.b&clientId=1"),
+                         "wss://api-feed.dhan.co?<redacted>")
+        self.assertEqual(r("bad request: pin=1234 totp=567890"), "bad request: pin=<redacted> totp=<redacted>")
+        for plain in ("HTTP 401 DH-901 Invalid_Authentication: invalid",
+                      "HTTPSConnectionPool(host='api.dhan.co', port=443): Read timed out. (read timeout=15)",
+                      "Token can be generated once every 2 minutes"):
+            self.assertEqual(r(plain), plain, "text without a query is left exactly as it was")
+        self.assertEqual(r(None), "None")
+
+
 class LockTests(Base):
     def test_stale_lock_is_broken(self):
         with open(tm.LOCK_FILE, "w") as f:
@@ -550,6 +685,14 @@ class CapabilityTests(unittest.TestCase):
         # nothing recognisable -> empty, never a crash
         for junk in (None, {}, {"data": None}, {"data": {"oc": {}}}, {"data": "x"}):
             self.assertEqual(caps._series(junk), {})
+
+    def test_ws_probe_error_carries_no_token(self):
+        import websockets
+        url = "wss://api-feed.dhan.co?version=2&token=eyJhbGci.eyJleHAi.SIGNATURE&clientId=1104477210&authType=2"
+        with patch.object(websockets, "connect", side_effect=OSError(f"could not open {url}")):
+            ok, why = asyncio.run(caps._ws_probe(url, {}, 1, False))
+        self.assertIs(ok, False)
+        self.assertEqual(why, "OSError: could not open wss://api-feed.dhan.co?<redacted>")
 
     def test_disconnect_packet(self):
         import struct

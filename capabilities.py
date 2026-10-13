@@ -29,7 +29,7 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, time as dtime
 
-from .token_manager import API_BASE, IST, DhanUnreachable, _json, _request, rest_headers
+from .token_manager import API_BASE, IST, DhanUnreachable, _json, _redact, _request, rest_headers
 
 NIFTY = 13                   # IDX_I  NIFTY 50
 HDFCBANK = 1333              # NSE_EQ HDFCBANK — liquid, always listed
@@ -234,7 +234,7 @@ async def _ws_probe(url: str, subscribe: dict, wait: float, in_hours: bool) -> t
     except websockets.InvalidStatus as e:
         return False, f"handshake rejected: HTTP {e.response.status_code}"
     except Exception as e:                       # noqa: BLE001
-        return False, f"{type(e).__name__}: {str(e)[:120]}"
+        return False, f"{type(e).__name__}: {_redact(e)[:120]}"     # the socket URL carries token=
 
 
 async def _ws_capabilities(client_id: str, access_token: str, wait: float) -> list[Capability]:
