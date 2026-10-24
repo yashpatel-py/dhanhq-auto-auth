@@ -37,10 +37,15 @@ HDFCBANK = 1333              # NSE_EQ HDFCBANK — liquid, always listed
 REST_GAP = 1.1               # marketfeed/* and charts/*: 1 request per second
 CHAIN_GAP = 3.2              # option chain: 1 unique request per 3 seconds
 
-# Data-API websocket disconnect reasons (Annexure)
-WS_REASONS = {805: "too many requests / connections", 806: "Data APIs not subscribed",
+# Data-API websocket disconnect reasons (Annexure, docs.dhanhq.co export of 2026-10-09)
+WS_REASONS = {800: "internal server error", 804: "requested number of instruments exceeds limit",
+              805: "too many requests / connections", 806: "Data APIs not subscribed",
               807: "access token expired", 808: "authentication failed", 809: "access token invalid",
-              810: "client id invalid"}
+              810: "client id invalid", 811: "invalid expiry date", 812: "invalid date format",
+              813: "invalid security id", 814: "invalid request"}
+
+# Dhan's rate-limit answers: DH-904 / 805 / HTTP 429 (older), RL001 RATE_LIMIT_ERROR (new docs)
+RATE_LIMIT_MARKS = ('"805"', "DH-904", "RL001", "RATE_LIMIT_ERROR")
 
 
 @dataclass
@@ -70,14 +75,15 @@ def _rest(headers: dict, path: str, payload: dict, timeout: int = 60) -> tuple[b
         except DhanUnreachable as e:
             return None, f"no answer: {e}", None
         text = r.text
-        if (r.status_code == 429 or '"805"' in text or "DH-904" in text) and attempt == 1:
+        limited = r.status_code == 429 or any(m in text for m in RATE_LIMIT_MARKS)
+        if limited and attempt == 1:
             time.sleep(3.0)
             continue
         break
     body = _json(r)
     if r.status_code == 200:
         return True, "served", body if isinstance(body, dict) else None
-    if r.status_code == 429 or '"805"' in text or "DH-904" in text:
+    if limited:
         return None, f"rate limited twice (HTTP {r.status_code}) — not an entitlement answer", None
     if "806" in text or "DH-902" in text or "not subscribed" in text.lower():
         return False, f"HTTP {r.status_code}: Data APIs refused (806 / DH-902) — entitlement on Dhan's side", None
@@ -191,12 +197,21 @@ def _rest_capabilities(headers: dict, today: date) -> list[Capability]:
 # WebSocket
 # ══════════════════════════════════════════════════════════════════════════
 def _disconnect_reason(frame: bytes) -> int | None:
-    """Data-API feeds announce a kick with a binary packet, response code 50."""
-    if isinstance(frame, (bytes, bytearray)) and len(frame) >= 10 and frame[0] == 50:
-        try:
-            return struct.unpack("<BHBIH", frame[:10])[4]
-        except struct.error:
-            return None
+    """Data-API feeds announce a kick with a binary packet, response code 50.
+
+    The two feeds frame it differently (docs.dhanhq.co, 2026-10):
+      live feed    8-byte header  — code at byte 0, int16 length, segment, int32 id; reason at bytes 8-9
+      depth feeds 12-byte header  — int16 length, code at byte 2, segment, int32 id, uint32 seq; reason at 12-13
+    """
+    if not isinstance(frame, (bytes, bytearray)):
+        return None
+    try:
+        if len(frame) >= 10 and frame[0] == 50:
+            return struct.unpack_from("<H", frame, 8)[0]
+        if len(frame) >= 14 and frame[2] == 50:
+            return struct.unpack_from("<H", frame, 12)[0]
+    except struct.error:
+        pass
     return None
 
 

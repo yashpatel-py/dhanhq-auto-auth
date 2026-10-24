@@ -110,8 +110,8 @@ assert io.api.dhan_http.access_token == tok
 """,
 }
 
-_SKIP_DIRS = {".venv", "venv", "__pycache__", ".git", "logs", "node_modules",
-              os.path.basename(_PKG_DIR), "yash_kotak_auth"}
+_SKIP_DIRS = {".venv", "venv", "__pycache__", ".git", "logs", "node_modules", "tests", "build", "dist",
+              "site-packages", os.path.basename(_PKG_DIR), "yash_kotak_auth"}
 
 
 def discover_consumers() -> list[str]:
@@ -124,7 +124,8 @@ def discover_consumers() -> list[str]:
         for dirpath, dirnames, filenames in os.walk(folder):
             dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
             for fn in filenames:
-                if fn.endswith(".py"):
+                # one-off probe scripts (nifty_orb/_probe_dhan.py) are not strategies
+                if fn.endswith(".py") and not fn.startswith(("_probe", "probe_")):
                     try:
                         with open(os.path.join(dirpath, fn), encoding="utf-8", errors="ignore") as f:
                             if "yash_dhan_auth" in f.read():
@@ -184,7 +185,7 @@ def main() -> int:
     check("token file present and readable", info is not None,
           "" if info else "no token yet — the first strategy to run will log in")
     if info:
-        check("token is from today (IST) and not near expiry", info["usable"],
+        check("token usable for today's session (not near expiry, outlives 15:45 IST)", info["usable"],
               f"type {info['token_type'] or '?'}, generated {info['generated_at']}, "
               f"expires {info['expires_at']} ({(info['seconds_left'] or 0) // 3600}h left)")
 

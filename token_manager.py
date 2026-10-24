@@ -27,9 +27,14 @@ plus what this account has actually returned):
     outage on 2026-10-01, reported by several users on madefortrade.in topic
     94453). No login fixes that — see data_access() / capabilities.py.
 
-Tokens are keyed on the IST calendar date on purpose: a token minted on day D
-is always valid past midnight of D, so "from today" guarantees the token
-spans the whole trading day; the JWT `exp` is checked too, as a belt.
+A token is used while its JWT `exp` is more than EXPIRY_MARGIN_SEC away AND,
+if today's trading session is still ahead, it outlives the session
+(SESSION_END). So a token minted at 23:55 carries through the next day
+without a second login at 00:00, while one minted at 10:00 is replaced at
+the first use after midnight rather than dying mid-session. Logins therefore
+happen at the token's own expiry (drifting ~5 min earlier per day through
+the evening) and never between 09:15 and 15:45 IST, except when Dhan has
+rejected the token outright.
 """
 from __future__ import annotations
 
@@ -42,7 +47,7 @@ import subprocess
 import threading
 import time
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time as dtime, timezone
 from zoneinfo import ZoneInfo
 
 import requests
@@ -72,6 +77,7 @@ LOCK_WAIT_SEC = 300
 VALIDATION_TTL_SEC = 120     # re-ask /profile about the same token at most this often (per process)
 MINT_GAP_SEC = 120           # Dhan: "Token can be generated once every 2 minutes"
 EXPIRY_MARGIN_SEC = 300      # treat a token as dead 5 min before its JWT exp
+SESSION_END = dtime(15, 45)  # IST; before this, a token must expire after it (NSE closes 15:30)
 
 # TOTP timing. On 2026-10-04 at 00:00 IST Dhan answered "Invalid TOTP" five
 # times in 90 s to codes from a secret that then logged in at 00:01:31 — the
@@ -95,7 +101,7 @@ REJECT_COOLDOWNS = (120, 300, 900, 1800)     # seconds, by consecutive rejected 
 NO_LOGIN_ENV = "YASH_DHAN_AUTH_NO_LOGIN"
 
 _cached_token: dict | None = None
-_token_date: date | None = None
+_cached_mtime: float | None = None        # TOKEN_FILE mtime the cache was read at
 _thread_lock = threading.RLock()          # guards the mutating path within one process
 _validated: dict[str, float] = {}         # access_token -> time.time() it last passed /profile
 _last_profile: dict | None = None         # last /profile body Dhan returned for the live token
@@ -238,7 +244,7 @@ def token_expiry(access_token: str) -> datetime | None:
 
 
 def _save_token(client_id: str, access_token: str, expiry_time: str | None = None) -> None:
-    global _cached_token, _token_date
+    global _cached_token, _cached_mtime
     now = _now_ist()
     exp = token_expiry(access_token)
     data = {
@@ -257,29 +263,34 @@ def _save_token(client_id: str, access_token: str, expiry_time: str | None = Non
     restrict_permissions(TOKEN_FILE)
 
     _cached_token = data
-    _token_date = now.date()
+    try:
+        _cached_mtime = os.path.getmtime(TOKEN_FILE)
+    except OSError:
+        _cached_mtime = None
     _validated[access_token] = time.time()       # Dhan just issued it — it is valid right now
 
     logger.info(f"Token saved (generated {data['generated_at']}, expires {data['expires_at']})")
 
 
 def _load_saved_token() -> dict | None:
-    global _cached_token, _token_date
-    today = _today_ist()
-    if _cached_token and _token_date == today:
+    """The token on disk, re-read whenever the file changed (one stat per call)."""
+    global _cached_token, _cached_mtime
+    try:
+        mtime = os.path.getmtime(TOKEN_FILE)
+    except OSError:
+        return None
+    if _cached_token and _cached_mtime == mtime:
         return _cached_token
-    if os.path.exists(TOKEN_FILE):
-        try:
-            with open(TOKEN_FILE) as f:
-                data = json.load(f)
-            if not isinstance(data, dict) or not data.get("access_token") or not data.get("client_id"):
-                return None
-            _cached_token = data
-            _token_date = today if data.get("generated_date") == today.isoformat() else None
-            return data
-        except Exception as e:                   # noqa: BLE001 — half-written file, OneDrive lock, bad JSON
-            logger.debug(f"Could not read {TOKEN_FILE}: {e}")
-    return None
+    try:
+        with open(TOKEN_FILE) as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or not data.get("access_token") or not data.get("client_id"):
+            return None
+        _cached_token, _cached_mtime = data, mtime
+        return data
+    except Exception as e:                       # noqa: BLE001 — half-written file, OneDrive lock, bad JSON
+        logger.debug(f"Could not read {TOKEN_FILE}: {e}")
+        return None
 
 
 def _invalidate_cache() -> None:
@@ -288,9 +299,9 @@ def _invalidate_cache() -> None:
     Needed after taking the cross-process lock: another process may have
     written a fresh token while we were queued behind it.
     """
-    global _cached_token, _token_date
+    global _cached_token, _cached_mtime
     _cached_token = None
-    _token_date = None
+    _cached_mtime = None
 
 
 def _is_from_today(saved: dict | None) -> bool:
@@ -298,11 +309,25 @@ def _is_from_today(saved: dict | None) -> bool:
 
 
 def _usable(saved: dict | None) -> bool:
-    """From today AND (offline) not within EXPIRY_MARGIN_SEC of its JWT exp."""
-    if not _is_from_today(saved):
+    """Usable now AND for the rest of today's trading session (offline check).
+
+    Not within EXPIRY_MARGIN_SEC of its JWT exp, and — while today's session
+    is still ahead — expiring after SESSION_END. A token minted at 23:55
+    yesterday therefore carries through today (no second login at 00:00);
+    one minted at 10:00 yesterday does not, since it would die mid-session,
+    so it is replaced at the first use after midnight. A token without a
+    readable exp falls back to "minted today (IST)".
+    """
+    if not saved:
         return False
     exp = token_expiry(saved["access_token"])
-    return exp is None or (exp - _now_ist()).total_seconds() > EXPIRY_MARGIN_SEC
+    if exp is None:
+        return _is_from_today(saved)
+    now = _now_ist()
+    if (exp - now).total_seconds() <= EXPIRY_MARGIN_SEC:
+        return False
+    session_end = now.replace(hour=SESSION_END.hour, minute=SESSION_END.minute, second=0, microsecond=0)
+    return now >= session_end or exp >= session_end
 
 
 def token_info() -> dict | None:
@@ -507,12 +532,25 @@ def _next_send_time(now: float, offset: float, last_step: int) -> float:
     return now
 
 
-def _clock_offset(resp, sent_at: float) -> float | None:
-    """This machine's clock minus Dhan's, in seconds, from a response's Date header."""
+def _measure_clock_offset() -> float | None:
+    """This machine's clock minus Dhan's auth server's, in seconds.
+
+    One round trip to auth.dhan.co: the midpoint of send and receive against
+    the reply's Date header, good to about half the round trip plus the
+    header's whole second. None if the probe fails or is too slow to mean
+    anything. Never derived from a login reply: a slow reply there reads as a
+    clock that is behind (2026-10-25: "-10 s" on an 11 s response), and
+    correcting for it sent the next codes from the wrong window.
+    """
+    from email.utils import parsedate_to_datetime
     try:
-        from email.utils import parsedate_to_datetime
-        return sent_at - parsedate_to_datetime(resp.headers["Date"]).timestamp()
-    except Exception:                            # noqa: BLE001 — header absent or a fake response
+        t0 = time.time()
+        resp = requests.head(AUTH_BASE, timeout=5, allow_redirects=False)
+        t1 = time.time()
+        if t1 - t0 > 3:
+            return None
+        return (t0 + t1) / 2 - parsedate_to_datetime(resp.headers["Date"]).timestamp()
+    except Exception:                            # noqa: BLE001 — no network, no Date header
         return None
 
 
@@ -545,7 +583,16 @@ def generate_token() -> tuple[str, str]:
             f"no login for another {cooling:.0f}s so that several strategies cannot stack failed "
             f"logins. {_reject_hint(state)}", retry_after=cooling)
 
-    kind, last, offset, attempts = "other", "no response", 0.0, 0
+    measured = _measure_clock_offset()
+    if measured is not None:
+        state["clock_offset"] = round(measured, 1)
+    # build every code on Dhan's clock when this one is visibly off; small
+    # readings are header rounding, and the mid-window rule absorbs those
+    offset = measured if measured is not None and abs(measured) > 2 else 0.0
+    if offset:
+        logger.warning(f"This machine's clock is {offset:+.1f}s against Dhan's — using Dhan's time for TOTP")
+
+    kind, last, attempts = "other", "no response", 0
     for attempt in range(1, TOTP_ATTEMPTS + 1):
         now = time.time()
         send_at = _next_send_time(now, offset, int(state.get("last_step", -1)))
@@ -578,11 +625,6 @@ def generate_token() -> tuple[str, str]:
             raise DhanUnreachable(f"Dhan did not answer the login: {last}")
         if kind != "rejected":
             break
-        seen = _clock_offset(resp, send_at)
-        if seen is not None:
-            state["clock_offset"] = round(seen, 1)
-            if abs(seen) > 3:
-                offset = seen                    # this clock is off: build the next code on Dhan's time
         if attempt < TOTP_ATTEMPTS:
             logger.warning(f"Login rejected ({last}) — trying the next TOTP window "
                            f"(attempt {attempt + 1}/{TOTP_ATTEMPTS})")
@@ -719,8 +761,8 @@ def data_access(client_id: str, access_token: str) -> tuple[bool, str]:
     body = r.text.strip()
     if r.status_code == 200 and '"success"' in body:
         return True, "market data served"
-    if r.status_code == 429 or '"805"' in body or "DH-904" in body:
-        return False, "rate limited (805 / DH-904) — not an entitlement answer; try again in a second"
+    if r.status_code == 429 or any(m in body for m in ('"805"', "DH-904", "RL001", "RATE_LIMIT_ERROR")):
+        return False, "rate limited (805 / DH-904 / RL001) — not an entitlement answer; try again in a second"
     if "806" in body or "DH-902" in body or "not Subscribed" in body:
         return False, ("Dhan refuses market data to this account (806 / DH-902) — "
                        "an entitlement on Dhan's side, not a login problem")
@@ -733,12 +775,14 @@ def data_access(client_id: str, access_token: str) -> tuple[bool, str]:
 def _refresh_locked() -> tuple[str, str]:
     """Obtain a new token. Caller must hold the login lock."""
     saved = _load_saved_token()
-    if saved and _is_from_today(saved):
-        logger.info("Today's token is no longer accepted — logging in again")
+    if saved and _usable(saved):
+        logger.info("The current token is no longer accepted by Dhan — logging in again")
         if token_type(saved["access_token"]) == "SELF":
             return renew_token()
     elif saved:
-        logger.info(f"Token is from {saved.get('generated_date', '?')} — logging in for today")
+        exp = token_expiry(saved["access_token"])
+        logger.info(f"Token minted {saved.get('generated_at', '?')} expires "
+                    f"{exp.strftime('%Y-%m-%d %H:%M') if exp else '?'} IST — logging in for a fresh one")
     else:
         logger.info("No saved token — logging in")
     return generate_token()

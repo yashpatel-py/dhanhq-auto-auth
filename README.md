@@ -186,14 +186,25 @@ cid, token = get_valid_token_with_retry()
 
 ## 4. The six paid Data-API capabilities — what they map to
 
-| Plan feature (₹499 + GST / month) | `get_client()` method | Endpoint | Limits / notes |
+| Plan feature (₹499 + GST / month) | `get_client()` method | Endpoint | Limits / notes (docs.dhanhq.co, Oct 2026) |
 |---|---|---|---|
-| **Real-time Price** | `ticker_data`, `ohlc_data`, `quote_data` (REST) · `market_feed()` (WS) | `POST /marketfeed/ltp` `/ohlc` `/quote` · `wss://api-feed.dhan.co` | REST 1 request/s; WS 5 sockets × 5000 instruments |
-| **Historical Data for 5 Years** | `historical_daily_data` · `intraday_minute_data` | `POST /charts/historical` · `/charts/intraday` | daily back to inception; intraday ≤90 days per call, intervals 1/5/15/25/60 |
-| **20 Market Depth** | `depth_feed(level=20)` | `wss://depth-api-feed.dhan.co/twentydepth` | ≤50 instruments per socket, NSE EQ/F&O |
-| **Option Chain on APIs** | `expiry_list` · `option_chain` | `POST /optionchain/expirylist` · `/optionchain` | **1 unique request per 3 s**; response nests `data` twice |
+| **Real-time Price** | `ticker_data`, `ohlc_data`, `quote_data` (REST) · `market_feed()` (WS) | `POST /marketfeed/ltp` `/ohlc` `/quote` · `wss://api-feed.dhan.co` | REST 1 request/s, ≤1,000 instruments per request; WS 5 sockets × 5,000 instruments, 100 per subscribe message |
+| **Historical Data for 5 Years** | `historical_daily_data` · `intraday_minute_data` | `POST /charts/historical` · `/charts/intraday` | daily back to inception; intraday ≤90 days per call, intervals 1/5/15/25/60. **All data APIs: 5 requests/s and 7,000 per day** — chunked history pulls count against that |
+| **20 Market Depth** | `depth_feed(level=20)` | `wss://depth-api-feed.dhan.co/twentydepth` | ≤50 instruments per socket, NSE EQ/F&O; request codes 23 subscribe, 25 unsubscribe, 11 disconnect |
+| **Option Chain on APIs** | `expiry_list` · `option_chain` | `POST /optionchain/expirylist` · `/optionchain` | **1 request per 3 s per underlying/expiry, and ≤10 distinct underlyings per 8 s**; response nests `data` twice; each strike row now also carries `average_price` and `security_id` |
 | **Full Market Depth** (200 levels) | `depth_feed(level=200)` | `wss://full-depth-api.dhan.co/twohundreddepth` | 1 instrument per socket |
-| **Expired Options Data** | `expired_options_data` | `POST /charts/rollingoption` | ≤30 days per call, up to 5 years back; `expiryCode` is required and **`0` is answered "expiryCode is required" — use `1`** (next weekly) |
+| **Expired Options Data** | `expired_options_data` | `POST /charts/rollingoption` | ≤45 days per call, up to 5 years back, NSE and BSE; `expiryCode` 1 = near, 2 = next, 3 = far — **`0` is answered "expiryCode is required"** |
+
+The API is **v2** and has not changed with Dhan's new documentation site
+(Oct 2026): same base URL, same auth endpoints, same data endpoints and
+socket URLs. The new site adds machine-readable references worth knowing —
+a full Markdown export (`docs.dhanhq.co/docs-export.md`), an OpenAPI spec
+(`docs.dhanhq.co/openapi/dhan-api-v2.yaml`), and a **sandbox**
+(`https://sandbox.dhan.co/v2`, tokens from cloud.dhanhq.co, trading +
+historical endpoints only) — and the SDK's stable **2.3.0** (8 Oct 2026)
+leaves every module this package relies on byte-identical to 2.2.0, adds an
+`on_ticks` callback to `FullDepth`, stops printing the token on connect, and
+needs Python ≥ 3.10.
 
 Trading and account APIs (orders, super/forever orders, portfolio, funds,
 statements, EDIS, kill switch) are free with every Dhan account and need
@@ -220,12 +231,17 @@ accordingly, after the SDK's own `{"status", "remarks", "data"}` envelope:
 
 `get_valid_token()` — the thing every helper above calls — does, in order:
 
-1. **Today's token on disk, Dhan accepts it** → returned. "Today" is the IST
-   calendar date it was minted (a token minted on day D is always good past
-   midnight, so a same-day token spans the whole trading day); the JWT
-   `exp` is also checked offline, with a 5-minute margin. Dhan is asked
-   (`/v2/profile`) at most once every **2 minutes per process**, so calling
-   this per request costs nothing.
+1. **The token on disk is usable and Dhan accepts it** → returned. Usable
+   means (checked offline from its JWT `exp`): more than 5 minutes from
+   expiry, and — while today's trading session is still ahead — expiring
+   after 15:45 IST, so it can never die mid-session. A token minted at
+   23:55 therefore carries through the next day with no second login at
+   midnight; one minted at 10:00 is replaced at the first use after
+   midnight. Logins thus happen at a token's own expiry (drifting ~5 min
+   earlier each day through the evening, then resetting to midnight) and
+   never between 09:15 and 15:45, unless Dhan rejects a token outright.
+   Dhan is asked (`/v2/profile`) at most once every **2 minutes per
+   process**, so calling this per request costs nothing.
 2. **Dhan unreachable while checking** (timeout, 429, 5xx) → today's token is
    returned anyway. A new login would fail just the same, and would only
    rotate the token under the other strategies once Dhan came back.
@@ -265,7 +281,8 @@ file: it is a live login to the account for 24 hours.
 |---|---|---|
 | `DH-901`, WS reason `807` / `809` | the token is dead (expired, or another login replaced it) | `force_refresh(bad_token=<the token you used>)`: if another strategy already replaced it, you get **that** token instead of a second login; then rebuild your client (or just call `get_client()` again) |
 | `806` / `DH-902` ("not subscribed … HTTP Status 451") | **entitlement**, not auth — Dhan is refusing Data APIs to the account | do **not** re-login (it changes nothing and rotates everyone's token); back off, alert, check `verify.py` section 2 (`dataPlan`) and Troubleshooting |
-| `DH-904`, `805`, HTTP 429 | rate limit | back off; the limits are per account, shared by all your strategies |
+| `DH-904`, `805`, HTTP 429, or `{"errorCode": "RL001", "errorType": "RATE_LIMIT_ERROR"}` | rate limit | back off; the limits are per account, shared by all your strategies (data APIs: 5/s and 7,000/day) |
+| WS reason `804` | more instruments than the socket allows | 5,000 on the live feed, 50 on 20-depth, 1 on 200-depth |
 | `DH-905` | your request parameters | fix the call — auth is fine |
 | `DH-907` | no data for that instrument/range | not an error of yours or of auth |
 | WS handshake OK, then bare close `1006`, no packets | stale token (or a market-closed feed) | re-ask `get_valid_token_with_retry()` before reconnecting |
@@ -358,7 +375,7 @@ generates a fresh token on first use.
 
 | Symptom | What it means |
 |---|---|
-| `CredentialsRejected … Dhan rejected 3 TOTP codes from 3 different windows: … Invalid TOTP` | Read the rest of the message — it says which of two things this is. **"These credentials logged in successfully at …"**: Dhan's login service is refusing valid codes, which it does for a minute or two around 00:00 IST (2026-10-04: five refusals in 90 s, then success with the same file; also 2026-09-23). Nothing to fix: the package waits out a short cool-down and tries again, and every strategy picks up the token the first one gets. **"If the PIN or TOTP secret changed…"**: these credentials have never worked — wrong Client ID, PIN or secret (re-doing *Setup TOTP* on Dhan changes the secret). Re-run `credentials_setup.py --test-login`. **"clock is ±Ns … fix the system clock"**: TOTP needs the clock within ~25 s. |
+| `CredentialsRejected … Dhan rejected 3 TOTP codes from 3 different windows: … Invalid TOTP` | Read the rest of the message — it says which of two things this is. **"These credentials logged in successfully at …"**: Dhan's login service is refusing valid codes, which it does for a minute or two around 00:00 IST (2026-10-04: five refusals in 90 s, then success with the same file; also 2026-09-23). Nothing to fix: the package waits out a short cool-down and tries again, and every strategy picks up the token the first one gets. **"If the PIN or TOTP secret changed…"**: these credentials have never worked — wrong Client ID, PIN or secret (re-doing *Setup TOTP* on Dhan changes the secret). Re-run `credentials_setup.py --test-login`. **"clock is ±Ns … fix the system clock"**: TOTP needs the clock within ~25 s; the offset is measured against Dhan before every login (a round trip to auth.dhan.co), and when it is visibly off the codes are built on Dhan's time, so a drifted clock still logs in — but `w32tm /resync` is the real fix. |
 | `LoginCoolingDown … no login for another Ns` | A round of codes was just rejected, by this process or another. Until the cool-down passes (2 min, then 5, 15, 30 after consecutive rounds) nobody logs in, so several strategies cannot stack failed logins on the account. Saving new credentials clears it immediately. |
 | `TokenMintThrottled … once every 2 minutes` | Something logged in less than 2 minutes ago — usually another strategy, whose token is already on disk. `get_valid_token_with_retry` waits and reuses it; nothing to do. |
 | `LoginDisabled … YASH_DHAN_AUTH_NO_LOGIN=1 on this machine` | This is the laptop and there is no usable token on disk. Copy today's `.dhan_token.json` from the server for a read-only session, or — only if the server is stopped — unset the variable. See §8. |

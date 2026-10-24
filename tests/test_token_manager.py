@@ -42,6 +42,13 @@ import logging                                            # noqa: E402
 logging.getLogger("auth.token_manager").setLevel(logging.CRITICAL)
 
 SECRET = "JBSWY3DPEHPK3PXP"          # a valid base32 TOTP secret (RFC 6238 test vector)
+_ORIG_MEASURE = tm._measure_clock_offset   # Base patches it out; one test exercises the original
+
+
+def jwt_exp(exp: datetime, typ: str = "APP", tag: str = "x") -> str:
+    """A Dhan-shaped token expiring at an exact moment."""
+    b64 = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")   # noqa: E731
+    return f"{b64({'alg': 'HS256'})}.{b64({'iss': 'dhan', 'iat': int(exp.timestamp()) - 86400, 'exp': int(exp.timestamp()), 'tokenConsumerType': typ, 'dhanClientId': '1', 'tag': tag})}.sig"
 
 
 def jwt(hours_left: float = 20.0, typ: str = "APP", tag: str = "x") -> str:
@@ -78,6 +85,7 @@ class Base(unittest.TestCase):
             patch.object(tm, "CREDS_FILE", os.path.join(d, ".dhan_credentials.json")),
             patch.object(tm, "STATE_FILE", os.path.join(d, ".dhan_login_state.json")),
             patch.object(tm, "restrict_permissions", lambda path: None),
+            patch.object(tm, "_measure_clock_offset", lambda: 0.0),     # no network probe in tests
         ]
         for p in self._patches:
             p.start()
@@ -119,16 +127,71 @@ class ClaimsTests(Base):
         self.assertEqual(tm.token_type("not-a-jwt"), "")
         self.assertIsNone(tm.token_expiry("not-a-jwt"))
 
-    def test_usable_needs_today_and_expiry_margin(self):
-        self.write_token(jwt(10))
-        self.assertTrue(tm._usable(tm._load_saved_token()))
-        self.write_token(jwt(10), day_offset=-1)
-        self.assertFalse(tm._usable(tm._load_saved_token()), "yesterday's token is never reused")
+    def test_usable_means_not_near_expiry_and_outliving_todays_session(self):
+        self.write_token(jwt(20))
+        self.assertTrue(tm._usable(tm._load_saved_token()), "20 h left always outlives today's session")
         self.write_token(jwt(hours_left=0.02))
         self.assertFalse(tm._usable(tm._load_saved_token()), "a token 72 s from exp is already dead")
 
+        day = datetime(2026, 10, 26, tzinfo=tm.IST)                       # a Monday
+        at = lambda h, m: day.replace(hour=h, minute=m)                      # noqa: E731
+        cases = [   # (now, exp, usable?)
+            (at(0, 10), at(23, 55), True,  "minted 23:55 yesterday: carries through today, no 00:00 login"),
+            (at(0, 10), at(10, 0),  False, "minted 10:00 yesterday: would die mid-session, replace now"),
+            (at(0, 10), at(15, 44), False, "expires a minute before the session cut-off"),
+            (at(0, 10), at(15, 46), True,  "expires after the session cut-off"),
+            (at(12, 0), at(15, 46), True,  "mid-session, outlives it"),
+            (at(15, 50), at(16, 30), True,  "session over: only the expiry margin matters"),
+            (at(16, 26), at(16, 30), False, "within the 5-minute margin"),
+            (at(9, 20), at(9, 30),  False, "session ahead and it dies in 10 minutes"),
+        ]
+        for now, exp, want, why in cases:
+            self.write_token(jwt_exp(exp), day_offset=-1)
+            with patch.object(tm, "_now_ist", return_value=now):
+                self.assertEqual(tm._usable(tm._load_saved_token()), want, why)
+        # no readable exp: fall back to "minted today"
+        with open(tm.TOKEN_FILE, "w") as f:
+            json.dump({"client_id": "1", "access_token": "opaque", "generated_date": tm._today_ist().isoformat()}, f)
+        tm._invalidate_cache()
+        self.assertTrue(tm._usable(tm._load_saved_token()))
+
+    def test_cache_follows_the_file_not_the_date(self):
+        a, b = jwt(20, tag="a"), jwt(20, tag="b")
+        self.write_token(a)
+        self.assertEqual(tm._load_saved_token()["access_token"], a)
+        self.write_token(b)                                  # another process replaced it
+        later = time.time() + 5
+        os.utime(tm.TOKEN_FILE, (later, later))
+        self.assertEqual(tm._load_saved_token()["access_token"], b, "a changed file is re-read")
+        os.unlink(tm.TOKEN_FILE)
+        self.assertIsNone(tm._load_saved_token(), "a removed file is not served from cache")
+
+    def test_measured_clock_offset_uses_the_round_trip_midpoint(self):
+        from email.utils import formatdate
+        class Head:
+            def __init__(self, ts): self.headers = {"Date": formatdate(ts, usegmt=True)}
+        now = time.time()
+        with patch.object(tm.requests, "head", return_value=Head(now - 10)):
+            off = _ORIG_MEASURE()
+        self.assertIsNotNone(off)
+        self.assertAlmostEqual(off, 10, delta=1.5, msg="this clock reads 10 s ahead of Dhan's")
+        with patch.object(tm.requests, "head", side_effect=OSError("no network")):
+            self.assertIsNone(_ORIG_MEASURE())
+
+    def test_a_visibly_off_clock_builds_codes_on_dhans_time(self):
+        import pyotp
+        tok = jwt(24)
+        with patch.object(tm, "_measure_clock_offset", lambda: 40.0), \
+                patch.object(tm, "_request", return_value=Resp(200, {"accessToken": tok})) as rq:
+            tm.generate_token()
+        sent = rq.call_args.kwargs["params"]["totp"]
+        dhan_now = time.time() - 40
+        self.assertIn(sent, {pyotp.TOTP(SECRET).at(dhan_now + d) for d in (-30, 0, 30)},
+                      "the code was built for Dhan's clock, not this machine's")
+        self.assertEqual(tm._read_state()["clock_offset"], 40.0)
+
     def test_token_info_is_offline_and_never_holds_the_token(self):
-        self.write_token(jwt(5))
+        self.write_token(jwt(20))
         with patch.object(tm, "_request", side_effect=AssertionError("network")):
             info = tm.token_info()
         self.assertTrue(info["usable"])
@@ -342,17 +405,28 @@ class GetValidTokenTests(Base):
         self.assertEqual(rq.call_count, 1, "the rejected token is not asked about again inside the lock")
         self.assertEqual(self.disk_token(), new)
 
-    def test_yesterdays_token_is_replaced_without_asking_dhan_about_it(self):
+    def test_a_token_that_would_die_mid_session_is_replaced_without_asking_dhan(self):
         new = jwt(24, tag="new")
-        self.write_token(jwt(20, tag="old"), day_offset=-1)
+        day = datetime(2026, 10, 26, tzinfo=tm.IST)
+        self.write_token(jwt_exp(day.replace(hour=10), tag="old"), day_offset=-1)   # minted 10:00 yesterday
 
         def fake_generate():
             tm._save_token("1", new)
             return "1", new
 
-        with patch.object(tm, "_request", side_effect=AssertionError("no /profile for a stale token")), \
+        with patch.object(tm, "_now_ist", return_value=day.replace(hour=0, minute=10)), \
+                patch.object(tm, "_request", side_effect=AssertionError("no /profile for a doomed token")), \
                 patch.object(tm, "generate_token", side_effect=fake_generate):
             self.assertEqual(tm.get_valid_token(), ("1", new))
+
+    def test_a_token_minted_last_evening_is_kept_past_midnight(self):
+        day = datetime(2026, 10, 26, tzinfo=tm.IST)
+        tok = jwt_exp(day.replace(hour=23, minute=55), tag="evening")                 # minted 23:55 yesterday
+        self.write_token(tok, day_offset=-1)
+        with patch.object(tm, "_now_ist", return_value=day.replace(hour=0, minute=10)), \
+                patch.object(tm, "_request", return_value=PROFILE_OK), \
+                patch.object(tm, "generate_token", side_effect=AssertionError("needless midnight login")):
+            self.assertEqual(tm.get_valid_token(), ("1", tok))
 
     def test_reuses_token_another_process_minted_while_we_queued(self):
         old, theirs = jwt(20, tag="old"), jwt(24, tag="theirs")
@@ -428,7 +502,7 @@ class NoLoginMachineTests(Base):
                 tm.renew_token()
 
     def test_stale_token_raises_login_disabled_and_is_not_retried(self):
-        self.write_token(jwt(20), day_offset=-1)
+        self.write_token(jwt(hours_left=-1), day_offset=-1)        # expired an hour ago
         with patch.object(tm, "_request", side_effect=AssertionError("no network")):
             with self.assertRaises(tm.LoginDisabled):
                 tm.get_valid_token_with_retry()
@@ -694,11 +768,27 @@ class CapabilityTests(unittest.TestCase):
         self.assertIs(ok, False)
         self.assertEqual(why, "OSError: could not open wss://api-feed.dhan.co?<redacted>")
 
-    def test_disconnect_packet(self):
+    def test_disconnect_packet_in_both_feed_layouts(self):
         import struct
+        # live feed: code first, reason at bytes 8-9
         self.assertEqual(caps._disconnect_reason(struct.pack("<BHBIH", 50, 10, 1, 1333, 806)), 806)
-        self.assertIsNone(caps._disconnect_reason(struct.pack("<BHBIH", 2, 10, 1, 1333, 0)))
+        self.assertIsNone(caps._disconnect_reason(struct.pack("<BHBIH", 2, 10, 1, 1333, 0)), "a ticker packet")
+        # depth feeds: int16 length, code at byte 2, segment, int32 id, uint32 sequence, reason at 12-13
+        self.assertEqual(caps._disconnect_reason(struct.pack("<hBBiIH", 14, 50, 1, 1333, 7, 805)), 805)
+        self.assertIsNone(caps._disconnect_reason(struct.pack("<hBBiIH", 14, 41, 1, 1333, 7, 805)), "a depth packet")
         self.assertIsNone(caps._disconnect_reason(b"\x32"))
+        self.assertIsNone(caps._disconnect_reason("text frame"))
+        self.assertEqual(caps.WS_REASONS[804], "requested number of instruments exceeds limit")
+
+    def test_new_rate_limit_answer_is_not_an_entitlement_verdict(self):
+        rl = Resp(429, {"status": "failure", "errorType": "RATE_LIMIT_ERROR", "errorCode": "RL001",
+                        "errorMessage": "Too many requests. Please retry after 1 second."})
+        with patch.object(caps, "_request", return_value=rl), patch.object(caps.time, "sleep", lambda s: None):
+            self.assertIsNone(caps._rest({}, "/x", {})[0])
+        with patch.object(tm, "_request", return_value=rl):
+            ok, why = tm.data_access("1", "t")
+        self.assertFalse(ok)
+        self.assertIn("rate limited", why)
 
     def test_market_hours(self):
         self.assertTrue(caps.market_open_now(datetime(2026, 10, 1, 10, 0, tzinfo=tm.IST)))    # Thu
